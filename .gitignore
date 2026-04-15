@@ -9,3 +9,7 @@ sessions/
 arc_state.json
 .env
 *.local.txt
+data/logs/
+data/sessions/
+data/arc_state.json
+data/accounts/*.local.txt

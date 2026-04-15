@@ -1,10 +1,12 @@
 """
 Arc Network daily automation.
 
-Configuration files in the project root:
-- accounts.local.txt: one Arc login email per line
-- gmail_passes.local.txt: one Gmail app password per line, matched by line number
-- proxies.local.txt: optional proxy per line, matched by line number
+Preferred configuration files:
+- data/accounts/accounts.local.txt: one Arc login email per line
+- data/accounts/gmail_passes.local.txt: one Gmail app password per line, matched by line number
+- data/accounts/proxies.local.txt: optional proxy per line, matched by line number
+
+Legacy root config files are still supported for backward compatibility.
 
 Run modes:
 - arc-bot --run-once

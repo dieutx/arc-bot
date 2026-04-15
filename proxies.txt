@@ -1,7 +1,0 @@
-# Template file only. Keep live proxy lines in proxies.local.txt.
-# Supported formats:
-# http://user:pass@host:port
-# https://user:pass@host:port
-# socks5://user:pass@host:port
-# http://host:port
-# none

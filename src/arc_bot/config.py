@@ -13,15 +13,27 @@ BASE_URL = "https://community.arc.network"
 PACKAGE_DIR = Path(__file__).resolve().parent
 SRC_DIR = PACKAGE_DIR.parent
 SCRIPT_DIR = SRC_DIR.parent
-LOG_DIR = SCRIPT_DIR / "logs"
-ACCOUNTS_FILE = SCRIPT_DIR / "accounts.txt"
-LOCAL_ACCOUNTS_FILE = SCRIPT_DIR / "accounts.local.txt"
-GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.txt"
-LOCAL_GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.local.txt"
-PROXIES_FILE = SCRIPT_DIR / "proxies.txt"
-LOCAL_PROXIES_FILE = SCRIPT_DIR / "proxies.local.txt"
-STATE_FILE = SCRIPT_DIR / "arc_state.json"
-SESSIONS_DIR = SCRIPT_DIR / "sessions"
+DATA_DIR = SCRIPT_DIR / "data"
+ACCOUNTS_DIR = DATA_DIR / "accounts"
+LOG_DIR = DATA_DIR / "logs"
+SESSIONS_DIR = DATA_DIR / "sessions"
+STATE_FILE = DATA_DIR / "arc_state.json"
+
+ACCOUNTS_FILE = ACCOUNTS_DIR / "accounts.txt"
+LOCAL_ACCOUNTS_FILE = ACCOUNTS_DIR / "accounts.local.txt"
+GMAIL_PASSES_FILE = ACCOUNTS_DIR / "gmail_passes.txt"
+LOCAL_GMAIL_PASSES_FILE = ACCOUNTS_DIR / "gmail_passes.local.txt"
+PROXIES_FILE = ACCOUNTS_DIR / "proxies.txt"
+LOCAL_PROXIES_FILE = ACCOUNTS_DIR / "proxies.local.txt"
+
+LEGACY_ACCOUNTS_FILE = SCRIPT_DIR / "accounts.txt"
+LEGACY_LOCAL_ACCOUNTS_FILE = SCRIPT_DIR / "accounts.local.txt"
+LEGACY_GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.txt"
+LEGACY_LOCAL_GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.local.txt"
+LEGACY_PROXIES_FILE = SCRIPT_DIR / "proxies.txt"
+LEGACY_LOCAL_PROXIES_FILE = SCRIPT_DIR / "proxies.local.txt"
+LEGACY_STATE_FILE = SCRIPT_DIR / "arc_state.json"
+LEGACY_SESSIONS_DIR = SCRIPT_DIR / "sessions"
 ENV_FILE = SCRIPT_DIR / ".env"
 PARENT_ENV_FILE = SCRIPT_DIR.parent / ".env"
 
@@ -69,8 +81,11 @@ class ConfigError(RuntimeError):
 
 
 def ensure_runtime_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_file(LEGACY_STATE_FILE, STATE_FILE)
 
 
 def ensure_config_templates() -> None:
@@ -91,7 +106,9 @@ def account_id(email: str) -> str:
 
 def session_path(email: str) -> Path:
     ensure_runtime_dirs()
-    return SESSIONS_DIR / f"{account_id(email)}.json"
+    session_file = SESSIONS_DIR / f"{account_id(email)}.json"
+    _migrate_legacy_file(LEGACY_SESSIONS_DIR / session_file.name, session_file)
+    return session_file
 
 
 def log_artifact_path(prefix: str, account_key: str, suffix: str = ".png") -> Path:
@@ -145,18 +162,40 @@ def load_runtime_accounts(
     ensure_config_templates()
 
     emails = _load_required_lines(
-        _resolve_config_file(LOCAL_ACCOUNTS_FILE, ACCOUNTS_FILE),
+        resolve_config_file(
+            LOCAL_ACCOUNTS_FILE,
+            ACCOUNTS_FILE,
+            LEGACY_LOCAL_ACCOUNTS_FILE,
+            LEGACY_ACCOUNTS_FILE,
+        ),
         ACCOUNT_TEMPLATE,
-        "No valid account emails were found in accounts.local.txt or accounts.txt.",
-        "No valid account emails were found in accounts.local.txt or accounts.txt.",
+        (
+            "No valid account emails were found in "
+            f"{display_path(LOCAL_ACCOUNTS_FILE)} or {display_path(ACCOUNTS_FILE)}."
+        ),
+        (
+            "No valid account emails were found in "
+            f"{display_path(LOCAL_ACCOUNTS_FILE)} or {display_path(ACCOUNTS_FILE)}."
+        ),
     )
     _reject_legacy_account_format(emails)
 
     gmail_passwords = _load_required_lines(
-        _resolve_config_file(LOCAL_GMAIL_PASSES_FILE, GMAIL_PASSES_FILE),
+        resolve_config_file(
+            LOCAL_GMAIL_PASSES_FILE,
+            GMAIL_PASSES_FILE,
+            LEGACY_LOCAL_GMAIL_PASSES_FILE,
+            LEGACY_GMAIL_PASSES_FILE,
+        ),
         GMAIL_PASSWORD_TEMPLATE,
-        "No valid Gmail app passwords were found in gmail_passes.local.txt or gmail_passes.txt.",
-        "No valid Gmail app passwords were found in gmail_passes.local.txt or gmail_passes.txt.",
+        (
+            "No valid Gmail app passwords were found in "
+            f"{display_path(LOCAL_GMAIL_PASSES_FILE)} or {display_path(GMAIL_PASSES_FILE)}."
+        ),
+        (
+            "No valid Gmail app passwords were found in "
+            f"{display_path(LOCAL_GMAIL_PASSES_FILE)} or {display_path(GMAIL_PASSES_FILE)}."
+        ),
     )
 
     if len(gmail_passwords) < len(emails):
@@ -165,9 +204,15 @@ def load_runtime_accounts(
             "Each account email must have a matching Gmail app password."
         )
     if len(gmail_passwords) > len(emails):
+        gmail_path = resolve_config_file(
+            LOCAL_GMAIL_PASSES_FILE,
+            GMAIL_PASSES_FILE,
+            LEGACY_LOCAL_GMAIL_PASSES_FILE,
+            LEGACY_GMAIL_PASSES_FILE,
+        )
         logger.warning(
             "%s has %d entries for %d accounts. Extra lines will be ignored.",
-            _resolve_config_file(LOCAL_GMAIL_PASSES_FILE, GMAIL_PASSES_FILE).name,
+            display_path(gmail_path),
             len(gmail_passwords),
             len(emails),
         )
@@ -191,18 +236,37 @@ def load_runtime_accounts(
     logger.info(
         "Loaded %d accounts from %s",
         len(accounts),
-        _resolve_config_file(LOCAL_ACCOUNTS_FILE, ACCOUNTS_FILE).name,
+        display_path(
+            resolve_config_file(
+                LOCAL_ACCOUNTS_FILE,
+                ACCOUNTS_FILE,
+                LEGACY_LOCAL_ACCOUNTS_FILE,
+                LEGACY_ACCOUNTS_FILE,
+            )
+        ),
     )
     logger.info(
         "Loaded %d Gmail app passwords from %s",
         len(accounts),
-        _resolve_config_file(LOCAL_GMAIL_PASSES_FILE, GMAIL_PASSES_FILE).name,
+        display_path(
+            resolve_config_file(
+                LOCAL_GMAIL_PASSES_FILE,
+                GMAIL_PASSES_FILE,
+                LEGACY_LOCAL_GMAIL_PASSES_FILE,
+                LEGACY_GMAIL_PASSES_FILE,
+            )
+        ),
     )
     return accounts
 
 
 def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
-    proxy_file = _resolve_config_file(LOCAL_PROXIES_FILE, PROXIES_FILE)
+    proxy_file = resolve_config_file(
+        LOCAL_PROXIES_FILE,
+        PROXIES_FILE,
+        LEGACY_LOCAL_PROXIES_FILE,
+        LEGACY_PROXIES_FILE,
+    )
     if not proxy_file.exists():
         _write_template_if_missing(PROXIES_FILE, PROXY_TEMPLATE)
         logger.warning(
@@ -217,7 +281,7 @@ def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
         missing = count - len(proxies)
         logger.warning(
             "%s has %d entries for %d accounts. %d account(s) will run without a proxy.",
-            proxy_file.name,
+            display_path(proxy_file),
             len(proxies),
             count,
             missing,
@@ -226,7 +290,7 @@ def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
     elif len(proxies) > count:
         logger.warning(
             "%s has %d entries for %d accounts. Extra lines will be ignored.",
-            proxy_file.name,
+            display_path(proxy_file),
             len(proxies),
             count,
         )
@@ -240,12 +304,12 @@ def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
             continue
         if not re.match(r"^(http|https|socks5)://", proxy):
             raise ConfigError(
-                f"Invalid proxy format on line {index} of {proxy_file.name}: "
+                f"Invalid proxy format on line {index} of {display_path(proxy_file)}: "
                 f"{redact_sensitive_text(proxy)!r}. "
                 "Use http://, https://, or socks5://."
             )
 
-    logger.info("Loaded proxy settings for %d accounts from %s", count, proxy_file.name)
+    logger.info("Loaded proxy settings for %d accounts from %s", count, display_path(proxy_file))
     return proxies[:count]
 
 
@@ -267,7 +331,7 @@ def _load_required_lines(
 def _reject_legacy_account_format(emails: list[str]) -> None:
     if any("----" in email for email in emails):
         raise ConfigError(
-            "Legacy combined email/password entries were detected in accounts.txt. "
+            "Legacy combined email/password entries were detected in the account file. "
             "Put only email addresses in accounts.txt and move Gmail app passwords "
             "to gmail_passes.txt."
         )
@@ -275,10 +339,31 @@ def _reject_legacy_account_format(emails: list[str]) -> None:
 
 def _write_template_if_missing(path: Path, content: str) -> None:
     if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
 
-def _resolve_config_file(local_path: Path, default_path: Path) -> Path:
-    if local_path.exists():
-        return local_path
-    return default_path
+def resolve_config_file(
+    local_path: Path,
+    default_path: Path,
+    legacy_local_path: Path,
+    legacy_default_path: Path,
+) -> Path:
+    for path in (local_path, legacy_local_path, legacy_default_path, default_path):
+        if path.exists():
+            return path
+    return local_path
+
+
+def display_path(path: Path) -> str:
+    try:
+        return path.relative_to(SCRIPT_DIR).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _migrate_legacy_file(source: Path, destination: Path) -> None:
+    if destination.exists() or not source.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(destination)

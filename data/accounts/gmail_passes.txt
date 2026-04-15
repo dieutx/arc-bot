@@ -1,0 +1,6 @@
+# Gmail app passwords, one per line
+# Lines are matched by position with accounts.txt.
+# Generate these from Google Account -> Security -> App passwords.
+# Example:
+# abcd efgh ijkl mnop
+# wxyz abcd efgh ijkl

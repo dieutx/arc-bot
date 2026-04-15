@@ -17,8 +17,8 @@ The code only contains expected outbound paths for the automation workflow:
 - Telegram `sendMessage` for run summaries
 
 2. Secret storage in tracked files was a real risk and has been fixed.
-- Live credentials were moved out of tracked config files and into ignored local files: `accounts.local.txt`, `gmail_passes.local.txt`, and `proxies.local.txt`
-- `.env` and `*.local.txt` are ignored by Git
+- Live credentials were moved out of tracked config files and into ignored local files under `data/accounts/`
+- `.env`, `data/accounts/*.local.txt`, and legacy root `*.local.txt` are ignored by Git
 - Tracked files now contain templates only
 
 3. Raw account identifiers were leaking into runtime artifacts and have been fixed.
@@ -41,6 +41,6 @@ The code only contains expected outbound paths for the automation workflow:
 - Main application package lives in `src/arc_bot`
 - `arc_daily.py` is retained as a compatibility entrypoint for existing cron jobs
 - Cron uses `CRON_TZ=Asia/Ho_Chi_Minh` and runs at `11 7 * * *`
-- Runtime logs go to `logs/`
-- Browser sessions go to `sessions/`
-- State is saved atomically to `arc_state.json`
+- Preferred runtime logs go to `data/logs/`
+- Preferred browser sessions go to `data/sessions/`
+- State is saved atomically to `data/arc_state.json`

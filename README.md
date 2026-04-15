@@ -12,8 +12,8 @@ The repository is organized as a Python package so it is easier to install, insp
 - `arc_daily.py`: compatibility wrapper for existing cron jobs and direct script usage
 - `pyproject.toml`: package metadata and console script definition
 - `ARCHITECTURE.md`: module map and runtime flow
-- `accounts.txt`, `gmail_passes.txt`, `proxies.txt`: tracked templates only
-- `accounts.local.txt`, `gmail_passes.local.txt`, `proxies.local.txt`: ignored runtime secrets
+- `data/accounts/`: tracked templates plus ignored local account files
+- `data/`: runtime logs, sessions, and state
 
 ## Runtime Workflow
 
@@ -38,6 +38,14 @@ arc-bot/
   pyproject.toml
   README.md
   SECURITY_REVIEW.md
+  data/
+    accounts/
+      accounts.txt
+      gmail_passes.txt
+      proxies.txt
+    logs/
+    sessions/
+    arc_state.json
   src/
     arc_bot/
       __init__.py
@@ -58,9 +66,6 @@ arc-bot/
       forum.py
       tasks.py
       notifications.py
-  accounts.txt
-  gmail_passes.txt
-  proxies.txt
 ```
 
 Module responsibilities:
@@ -174,7 +179,9 @@ python3 arc_daily.py --setup-cron
 
 Tracked files are templates only. Never store live secrets in tracked files.
 
-### `accounts.local.txt`
+Preferred operator files live under `data/accounts/`. Legacy root files are still accepted for backward compatibility, but new setups should use the `data/accounts/` layout.
+
+### `data/accounts/accounts.local.txt`
 
 One Arc login email per line:
 
@@ -185,18 +192,18 @@ bob@example.com
 
 Only email addresses are valid. The old `email----password` format is not supported.
 
-### `gmail_passes.local.txt`
+### `data/accounts/gmail_passes.local.txt`
 
-One Gmail app password per line. Line order must match `accounts.local.txt`.
+One Gmail app password per line. Line order must match `data/accounts/accounts.local.txt`.
 
 ```text
 abcd efgh ijkl mnop
 wxyz abcd efgh ijkl
 ```
 
-### `proxies.local.txt`
+### `data/accounts/proxies.local.txt`
 
-Optional. One proxy per line. Line order must match `accounts.local.txt`.
+Optional. One proxy per line. Line order must match `data/accounts/accounts.local.txt`.
 
 Supported formats:
 
@@ -248,12 +255,14 @@ The cron helper intentionally uses the root wrapper `arc_daily.py` so existing s
 
 ## Runtime Files
 
-- `logs/`: runtime logs and screenshots
-- `sessions/`: browser storage state files
-- `arc_state.json`: per-account local state
-- `logs/arc_cron.log`: cron output
+- `data/logs/`: runtime logs and screenshots
+- `data/sessions/`: browser storage state files
+- `data/arc_state.json`: per-account local state
+- `data/logs/arc_cron.log`: cron output
 
 Runtime artifacts use hashed account labels such as `acct_529ca001` instead of raw email addresses.
+
+When an older root-level `arc_state.json` or hashed session file is present, the bot migrates it into `data/` automatically on use.
 
 ## Security Model
 

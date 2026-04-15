@@ -11,11 +11,19 @@ from .config import (
     LOCAL_ACCOUNTS_FILE,
     LOCAL_GMAIL_PASSES_FILE,
     LOCAL_PROXIES_FILE,
+    LEGACY_ACCOUNTS_FILE,
+    LEGACY_GMAIL_PASSES_FILE,
+    LEGACY_LOCAL_ACCOUNTS_FILE,
+    LEGACY_LOCAL_GMAIL_PASSES_FILE,
+    LEGACY_LOCAL_PROXIES_FILE,
+    LEGACY_PROXIES_FILE,
     LOG_DIR,
     SCRIPT_DIR,
     ConfigError,
+    display_path,
     ensure_config_templates,
     read_non_comment_lines,
+    resolve_config_file,
 )
 
 CRON_SCHEDULE_RE = re.compile(r"^[\d*/,\-]+(?:\s+[\d*/,\-]+){4}$")
@@ -119,32 +127,58 @@ def print_config_status() -> None:
     files = [
         (
             LOCAL_ACCOUNTS_FILE,
+            LEGACY_LOCAL_ACCOUNTS_FILE,
+            LEGACY_ACCOUNTS_FILE,
             True,
-            "Add one Arc login email per line in accounts.local.txt.",
+            f"Add one Arc login email per line in {display_path(LOCAL_ACCOUNTS_FILE)}.",
         ),
         (
             LOCAL_GMAIL_PASSES_FILE,
+            LEGACY_LOCAL_GMAIL_PASSES_FILE,
+            LEGACY_GMAIL_PASSES_FILE,
             True,
-            "Add one Gmail app password per line in gmail_passes.local.txt. The order must match accounts.local.txt.",
+            (
+                "Add one Gmail app password per line in "
+                f"{display_path(LOCAL_GMAIL_PASSES_FILE)}. "
+                f"The order must match {display_path(LOCAL_ACCOUNTS_FILE)}."
+            ),
         ),
         (
             LOCAL_PROXIES_FILE,
+            LEGACY_LOCAL_PROXIES_FILE,
+            LEGACY_PROXIES_FILE,
             False,
-            "Optional. Add one proxy per line in proxies.local.txt, or leave the file blank to run direct connections.",
+            (
+                "Optional. Add one proxy per line in "
+                f"{display_path(LOCAL_PROXIES_FILE)}, or leave the file blank to run direct connections."
+            ),
         ),
     ]
 
-    for path, required, hint in files:
-        lines = read_non_comment_lines(path)
-        if path == LOCAL_ACCOUNTS_FILE and any("----" in line for line in lines):
-            print(f"  {path.name}: invalid legacy format detected. {hint}")
+    for preferred_path, legacy_local_path, legacy_default_path, required, hint in files:
+        resolved_path = resolve_config_file(
+            preferred_path,
+            preferred_path.with_name(preferred_path.name.replace(".local", "")),
+            legacy_local_path,
+            legacy_default_path,
+        )
+        lines = read_non_comment_lines(resolved_path)
+        if preferred_path == LOCAL_ACCOUNTS_FILE and any("----" in line for line in lines):
+            print(f"  {display_path(resolved_path)}: invalid legacy format detected. {hint}")
             continue
 
         if lines:
-            print(f"  {path.name}: {len(lines)} configured entr{'y' if len(lines) == 1 else 'ies'}")
+            suffix = ""
+            if resolved_path != preferred_path and resolved_path != preferred_path.with_name(preferred_path.name.replace(".local", "")):
+                suffix = f" (legacy root file; preferred path: {display_path(preferred_path)})"
+            print(
+                "  "
+                f"{display_path(resolved_path)}: {len(lines)} configured entr{'y' if len(lines) == 1 else 'ies'}"
+                f"{suffix}"
+            )
             continue
 
         if required:
-            print(f"  {path.name}: missing required content. {hint}")
+            print(f"  {display_path(preferred_path)}: missing required content. {hint}")
         else:
-            print(f"  {path.name}: empty. {hint}")
+            print(f"  {display_path(preferred_path)}: empty. {hint}")

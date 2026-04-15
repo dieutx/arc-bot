@@ -53,16 +53,17 @@ PYTHONPATH=src python3 -m arc_bot --help
 
 ## Secrets and Safety
 
-- Never print or commit live values from `accounts.local.txt`, `gmail_passes.local.txt`, `proxies.local.txt`, or `.env`.
+- Never print or commit live values from `data/accounts/*.local.txt`, legacy root `*.local.txt`, or `.env`.
 - Never expose bot tokens, chat IDs, email addresses, app passwords, proxy credentials, session files, or magic links in comments, commit messages, logs shown to the user, or docs.
 - Before any push, confirm local secret files are still ignored and not staged.
 - The codebase intentionally uses hashed account IDs like `acct_529ca001` in logs and artifacts.
 
 ## Runtime Files
 
-- `logs/`: runtime logs and screenshots
-- `sessions/`: browser storage state
-- `arc_state.json`: local task state
+- `data/accounts/`: preferred account and proxy input files
+- `data/logs/`: runtime logs and screenshots
+- `data/sessions/`: browser storage state
+- `data/arc_state.json`: local task state
 
 These are runtime artifacts, not source files.
 
@@ -81,6 +82,7 @@ These are runtime artifacts, not source files.
 ## Editing Guidance
 
 - Prefer changing code in `src/arc_bot/`, not in generated artifacts.
+- Prefer the `data/` layout over root-level config/runtime files. Root files are legacy compatibility inputs only.
 - Prefer the focused modules over the compatibility facades:
   - runtime flow: `runner.py`
   - setup/cron: `setup_ops.py`

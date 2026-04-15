@@ -48,6 +48,9 @@ Normal execution path:
 
 ## Editing Rules
 
+- Preferred operator input lives in `data/accounts/`.
+- Preferred runtime artifacts live in `data/logs/`, `data/sessions/`, and `data/arc_state.json`.
+- Root-level config/state/session files are legacy compatibility paths. Do not add new features around them.
 - Add task behavior in the focused task modules, not in `tasks.py`.
 - Add orchestration behavior in `runner.py`, not in `cli.py`.
 - Add setup or cron behavior in `setup_ops.py`.

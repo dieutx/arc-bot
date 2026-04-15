@@ -1,5 +1,0 @@
-# Template file only. Keep live account emails in accounts.local.txt.
-# One Arc login email per line.
-# Example:
-# alice@gmail.com
-# bob@example.com

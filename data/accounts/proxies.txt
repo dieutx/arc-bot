@@ -1,0 +1,8 @@
+# Optional proxies, one per line
+# Lines are matched by position with accounts.txt.
+# Use "none" or leave a line blank to run an account without a proxy.
+# Supported formats:
+# http://user:pass@host:port
+# https://user:pass@host:port
+# socks5://user:pass@host:port
+# http://host:port

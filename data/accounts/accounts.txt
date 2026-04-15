@@ -1,0 +1,5 @@
+# Arc account emails, one per line
+# Lines are matched by position with gmail_passes.txt and proxies.txt.
+# Example:
+# alice@gmail.com
+# bob@example.com
