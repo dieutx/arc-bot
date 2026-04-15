@@ -1,0 +1,43 @@
+# Security Review
+
+Date: 2026-04-15
+
+## Scope
+
+Reviewed the repository for hidden outbound behavior, accidental secret exposure, and operator-facing leaks in logs, state, screenshots, sessions, and notifications.
+
+## Findings
+
+1. No hidden exfiltration logic was found.
+The code only contains expected outbound paths for the automation workflow:
+- Arc Network via Playwright browser navigation
+- Gmail IMAP for magic-link retrieval
+- Optional proxy tunneling for browser traffic
+- Telegram `sendMessage` for run summaries
+
+2. Secret storage in tracked files was a real risk and has been fixed.
+- Live credentials were moved out of tracked config files and into ignored local files: `accounts.local.txt`, `gmail_passes.local.txt`, and `proxies.local.txt`
+- `.env` and `*.local.txt` are ignored by Git
+- Tracked files now contain templates only
+
+3. Raw account identifiers were leaking into runtime artifacts and have been fixed.
+- Session files, screenshots, state keys, logs, and summaries now use stable hashed labels such as `acct_529ca001`
+- Existing state remains readable through legacy-key migration support
+
+4. Runtime exceptions could leak secrets through logs or Telegram summaries and have been reduced.
+- Added centralized redaction for emails, bot tokens, Gmail app passwords, proxy credentials, and sensitive URLs
+- Account-level errors and task failures now store and report sanitized messages
+- Telegram notifications send sanitized summary text only
+
+## Residual Risks
+
+- Browser automation still depends on the current Arc UI and external services controlled by Arc, Gmail, and the configured proxies.
+- A future code change could introduce a new outbound path, so any new networking dependency should be reviewed before deployment.
+- Telegram summaries intentionally send task status and account hashes off-host; disable Telegram configuration if that is not acceptable for a given environment.
+
+## Hardening Notes
+
+- Cron uses `CRON_TZ=Asia/Ho_Chi_Minh` and runs at `11 7 * * *`
+- Runtime logs go to `logs/`
+- Browser sessions go to `sessions/`
+- State is saved atomically to `arc_state.json`

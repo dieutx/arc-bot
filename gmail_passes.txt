@@ -1,1 +1,5 @@
-1111
+# Template file only. Keep live Gmail app passwords in gmail_passes.local.txt.
+# One Gmail app password per line.
+# Example:
+# abcd efgh ijkl mnop
+# wxyz abcd efgh ijkl

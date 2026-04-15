@@ -1,1377 +1,643 @@
 """
-Arc Network 每日积分自动化脚本（多账号版）
-任务：
-  1. Content 阅读 5 篇文章   +25 分
-  2. Content 观看 1 个短视频  +5 分
-  3. Events 注册新活动        +5 分/个
-  4. Discussions 发 1 篇帖子  +10 分
-  5. Discussions 评论 2 条帖子 +10 分
+Arc Network daily automation.
 
-账号配置文件 accounts.txt（与本脚本同目录），每行一个账号：
-  格式：邮箱----应用专用密码
-  示例：
-    alice@gmail.com----abcd efgh ijkl mnop
-    bob@gmail.com----wxyz abcd efgh ijkl
+Configuration files in the repository root:
+- accounts.local.txt: one Arc login email per line
+- gmail_passes.local.txt: one Gmail app password per line, matched by line number
+- proxies.local.txt: optional proxy per line, matched by line number
 
-代理配置文件 proxies.txt（与本脚本同目录），每行一个代理，与账号按行对应：
-  支持格式：
-    http://user:pass@host:port
-    socks5://user:pass@host:port
-    http://host:port            （无认证）
-  示例：
-    http://user1:pass1@1.2.3.4:8080
-    socks5://user2:pass2@5.6.7.8:1080
-    http://9.10.11.12:3128
-  注意：
-    - 行数必须与 accounts.txt 一致（一一对应）
-    - 如果某行写 none 或留空，该账号不使用代理（不推荐）
-
-Gmail 准备步骤（每个账号）：
-  1. Google 账户 → 安全 → 两步验证（必须开启）
-  2. Google 账户 → 安全 → 应用专用密码 → 生成 16 位密码
-  3. Gmail 设置 → 转发和 POP/IMAP → 启用 IMAP
-
-用法：
-  # 首次部署（安装依赖 + Chromium + 配置 cron）：
-  python arc_daily.py --setup
-
-  # 每日执行（无头浏览器，cron 自动调用）：
-  python arc_daily.py
+Run modes:
+- python arc_daily.py --run-once
+- python arc_daily.py --daemon
+- python arc_daily.py --setup
+- python arc_daily.py --setup-cron
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import sys
-import os
 import random
-import imaplib
-import email as email_lib
-import re
-import json
-import logging
-import time
-import socket
-import threading
-import select
-from datetime import datetime, date, timezone, timedelta
-from pathlib import Path
+import shlex
+import subprocess
+import sys
 from dataclasses import dataclass, field
-from playwright.async_api import async_playwright, Page, BrowserContext, Browser
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Awaitable, Callable, TypeVar
 
-# ─── 常量 ────────────────────────────────────────────────────────────────────
-BASE_URL      = "https://community.arc.network"
-SCRIPT_DIR    = Path(__file__).parent
-LOG_DIR       = SCRIPT_DIR.parent / "security-reports"
-ACCOUNTS_FILE     = SCRIPT_DIR / "accounts.txt"
-GMAIL_PASSES_FILE = SCRIPT_DIR / "gmail_passes.txt"
-PROXIES_FILE      = SCRIPT_DIR / "proxies.txt"
-STATE_FILE    = SCRIPT_DIR / "arc_state.json"
-SESSIONS_DIR  = SCRIPT_DIR / "sessions"   # 存放各账号的浏览器 session
+from config import (
+    BASE_URL,
+    DEFAULT_CRON_SCHEDULE,
+    DEFAULT_DAEMON_INTERVAL_HOURS,
+    ACCOUNTS_FILE,
+    LOCAL_ACCOUNTS_FILE,
+    GMAIL_PASSES_FILE,
+    LOCAL_GMAIL_PASSES_FILE,
+    LOG_DIR,
+    PROXIES_FILE,
+    LOCAL_PROXIES_FILE,
+    SCRIPT_DIR,
+    STATE_FILE,
+    Account,
+    ConfigError,
+    account_id,
+    describe_proxy,
+    ensure_config_templates,
+    ensure_runtime_dirs,
+    load_runtime_accounts,
+    read_non_comment_lines,
+    session_path,
+)
+from logging_utils import configure_logger, safe_exception_message
+from state import clone_account_state, commit_account_state, load_state, save_state
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+ensure_runtime_dirs()
+log, log_file = configure_logger(LOG_DIR)
 
-# ─── 发帖/评论文案库 ─────────────────────────────────────────────────────────
-POST_TEMPLATES = [
-    "What are the most exciting use cases you've seen being built on Arc recently? Would love to hear what the community is working on!",
-    "For those building with Arc App Kits — what has your experience been like so far? Any tips for getting started quickly?",
-    "Curious about the community's thoughts on stablecoin adoption trends. Are we seeing more real-world usage than last year?",
-    "Has anyone attended recent Arc Office Hours? What topics came up that were most useful for builders?",
-    "What tooling or documentation improvements would most help you as an Arc developer? Open to discussing pain points.",
-    "How are developers handling cross-chain UX challenges when building on Arc? Would love to compare approaches.",
-    "Are there any Arc community projects looking for contributors? Happy to help with testing or docs.",
-    "What's your take on the role of stablecoins in DeFi liquidity? Curious how Arc builders are thinking about this.",
+RUNTIME_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
 ]
 
-COMMENT_TEMPLATES = [
-    "Great perspective, thanks for sharing this!",
-    "Really useful to hear — appreciate you writing this up.",
-    "This matches my experience too. Good to know others are thinking along the same lines.",
-    "Interesting take. Have you explored how this might work at scale?",
-    "Thanks for the detailed write-up — bookmarking this for reference.",
-    "Solid question. I've been wondering about this as well.",
-    "Appreciate the insight — this gives me a new angle to consider.",
-    "Well said. The ecosystem definitely benefits from more discussions like this.",
-]
+T = TypeVar("T")
 
-# ─── 数据结构 ─────────────────────────────────────────────────────────────────
-@dataclass
-class Account:
-    email: str
-    app_pass: str
-    proxy: str | None = None  # e.g. "http://user:pass@host:port" or "socks5://..."
 
-@dataclass
+@dataclass(slots=True)
 class AccountResult:
-    email: str
+    account_key: str
     score_before: int | None = None
     score_after: int | None = None
-    tasks_done: dict = field(default_factory=dict)
+    tasks_done: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
 
     def gained(self) -> int | None:
-        if self.score_before is not None and self.score_after is not None:
-            return self.score_after - self.score_before
-        return None
-
-# ─── 日志 ────────────────────────────────────────────────────────────────────
-log_file = LOG_DIR / f"arc_daily_{date.today()}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger("arc")
-
-
-# ─── 通用：读取配置文件中的有效行（忽略空行和 # 注释）──────────────────────────
-def _read_lines(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-
-# ─── 账号文件读取 ─────────────────────────────────────────────────────────────
-def load_accounts() -> list[Account]:
-    if not ACCOUNTS_FILE.exists():
-        ACCOUNTS_FILE.write_text(
-            "# Arc 登录邮箱列表，每行一个，与 gmail_passes.txt / proxies.txt 按行对应\n"
-            "# 示例：\n"
-            "# alice@gmail.com\n"
-            "# bob@gmail.com\n",
-            encoding="utf-8",
-        )
-        log.error(f"accounts.txt 不存在，已创建示例，请填写后重新运行。")
-        sys.exit(1)
-
-    emails = _read_lines(ACCOUNTS_FILE)
-    if not emails:
-        log.error("accounts.txt 中没有有效邮箱，请检查。")
-        sys.exit(1)
-
-    log.info(f"加载 {len(emails)} 个账号")
-    return [Account(email=e, app_pass="") for e in emails]
-
-
-# ─── Gmail 应用专用密码读取 ───────────────────────────────────────────────────
-def load_gmail_passes(count: int) -> list[str]:
-    if not GMAIL_PASSES_FILE.exists():
-        GMAIL_PASSES_FILE.write_text(
-            "# Gmail 应用专用密码，每行一个，与 accounts.txt 按行一一对应\n"
-            "# 在 Google 账户 → 安全 → 应用专用密码 中生成（16位，空格可保留）\n"
-            "# 示例：\n"
-            "# abcd efgh ijkl mnop\n"
-            "# wxyz abcd efgh ijkl\n",
-            encoding="utf-8",
-        )
-        log.error(f"gmail_passes.txt 不存在，已创建示例，请填写后重新运行。")
-        sys.exit(1)
-
-    passes = _read_lines(GMAIL_PASSES_FILE)
-
-    if len(passes) < count:
-        log.error(
-            f"gmail_passes.txt 只有 {len(passes)} 条，但有 {count} 个账号，请补全。"
-        )
-        sys.exit(1)
-    if len(passes) > count:
-        log.warning(f"gmail_passes.txt 有 {len(passes)} 条，多于账号数 {count}，多余行已忽略。")
-
-    log.info(f"加载 {count} 条 Gmail 应用密码")
-    return passes[:count]
-
-
-# ─── 代理文件读取 ─────────────────────────────────────────────────────────────
-def load_proxies(count: int) -> list[str | None]:
-    """读取 proxies.txt，返回与账号等长的代理列表。缺少行时报错退出。"""
-    if not PROXIES_FILE.exists():
-        log.warning(f"代理文件不存在，所有账号将直连。如需代理请创建 {PROXIES_FILE}")
-        return [None] * count
-
-    lines = []
-    for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        lines.append(None if line.lower() == "none" else line)
-
-    if len(lines) < count:
-        gap = count - len(lines)
-        log.warning(f"proxies.txt 只有 {len(lines)} 条代理，账号有 {count} 个，剩余 {gap} 个账号将直连。")
-        lines += [None] * gap
-
-    if len(lines) > count:
-        log.warning(f"proxies.txt 有 {len(lines)} 条，账号有 {count} 个，多余代理已忽略。")
-
-    # 校验格式
-    for i, proxy in enumerate(lines[:count], 1):
-        if proxy is None:
-            log.warning(f"proxies.txt 第{i}行为 none，账号 {i} 将不走代理（风险较高）。")
-            continue
-        if not re.match(r'^(http|https|socks5)://', proxy):
-            log.error(f"proxies.txt 第{i}行格式不正确（需以 http:// 或 socks5:// 开头）: {proxy}")
-            sys.exit(1)
-
-    log.info(f"加载 {count} 条代理")
-    return lines[:count]
-
-
-# ─── socks5 带认证代理转发（纯 Python asyncio HTTP 代理）────────────────────
-_tunnel_servers: dict[str, tuple] = {}  # proxy_url -> (local_port, server, thread)
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-def _parse_socks5_url(proxy_url: str):
-    """解析 socks5://user:pass@host:port"""
-    m = re.match(r'socks5://(?:([^:@]+):([^@]+)@)?([^:]+):(\d+)', proxy_url)
-    if not m:
-        raise ValueError(f"无法解析 socks5 URL: {proxy_url}")
-    username, password, host, port = m.groups()
-    return username, password, host, int(port)
-
-def _run_http_proxy(local_port: int, socks5_url: str, stop_event):
-    """
-    在线程里运行一个简单的 HTTP CONNECT 代理，将请求转发到 socks5。
-    使用 python-socks 库连接 socks5（支持认证）。
-    """
-    try:
-        from python_socks.sync import Socks5Proxy
-    except ImportError:
-        from python_socks import Socks5Proxy
-
-    username, password, socks_host, socks_port = _parse_socks5_url(socks5_url)
-
-    def handle_client(conn: socket.socket):
-        try:
-            data = conn.recv(4096)
-            if not data:
-                return
-            first_line = data.split(b'\r\n')[0].decode()
-            parts = first_line.split()
-            if len(parts) < 2:
-                return
-            method, target = parts[0], parts[1]
-
-            if method == 'CONNECT':
-                # HTTPS 隧道
-                host, port = target.rsplit(':', 1)
-                port = int(port)
-            else:
-                # HTTP 直连
-                from urllib.parse import urlparse
-                parsed = urlparse(target)
-                host = parsed.hostname
-                port = parsed.port or 80
-
-            # 通过 socks5 连接目标
-            proxy = Socks5Proxy(
-                proxy_host=socks_host, proxy_port=socks_port,
-                username=username, password=password, rdns=True,
-            )
-            remote = proxy.connect(dest_host=host, dest_port=port)
-
-            if method == 'CONNECT':
-                conn.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
-            else:
-                remote.sendall(data)
-
-            # 双向转发
-            def forward(src, dst):
-                try:
-                    while True:
-                        r, _, _ = select.select([src], [], [], 5)
-                        if not r:
-                            break
-                        chunk = src.recv(8192)
-                        if not chunk:
-                            break
-                        dst.sendall(chunk)
-                except Exception:
-                    pass
-                finally:
-                    try: src.close()
-                    except: pass
-                    try: dst.close()
-                    except: pass
-
-            t = threading.Thread(target=forward, args=(remote, conn), daemon=True)
-            t.start()
-            forward(conn, remote)
-        except Exception:
-            try: conn.close()
-            except: pass
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", local_port))
-    srv.listen(32)
-    srv.settimeout(1)
-    while not stop_event.is_set():
-        try:
-            conn, _ = srv.accept()
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
-        except socket.timeout:
-            continue
-        except Exception:
-            break
-    srv.close()
-
-def start_socks5_tunnel(proxy_url: str) -> str:
-    """对 socks5://user:pass@host:port，在本地起 HTTP 代理转发，返回 http://127.0.0.1:PORT"""
-    if proxy_url in _tunnel_servers:
-        port, stop_event, t = _tunnel_servers[proxy_url]
-        if t.is_alive():
-            return f"http://127.0.0.1:{port}"
-        else:
-            del _tunnel_servers[proxy_url]
-
-    port = _free_port()
-    stop_event = threading.Event()
-    t = threading.Thread(
-        target=_run_http_proxy, args=(port, proxy_url, stop_event), daemon=True
-    )
-    t.start()
-    time.sleep(0.3)
-    log.info(f"  [proxy] socks5 -> http://127.0.0.1:{port}")
-    _tunnel_servers[proxy_url] = (port, stop_event, t)
-    return f"http://127.0.0.1:{port}"
-
-def stop_all_tunnels():
-    """停止所有本地代理线程"""
-    for url, (port, stop_event, t) in _tunnel_servers.items():
-        stop_event.set()
-    _tunnel_servers.clear()
-
-
-def parse_proxy(proxy_url: str) -> dict:
-    """
-    将代理 URL 解析为 Playwright context 所需的 proxy dict。
-    Playwright 格式：{"server": "...", "username": "...", "password": "***"}
-
-    注意：Playwright Chromium 不支持 socks5 带认证。
-    对于 socks5://user:pass@host:port，自动用 gost 转成本地无认证 http 代理。
-    """
-    m = re.match(
-        r'^((?:http|https|socks5)://)(?:([^:@]+):([^@]+)@)?(.+)$',
-        proxy_url,
-    )
-    if not m:
-        return {"server": proxy_url}
-
-    scheme, username, password, hostport = m.groups()
-
-    # socks5 带认证：Chromium 不支持，用纯 Python 本地 HTTP 代理转发
-    if scheme == "socks5://" and username:
-        local_http = start_socks5_tunnel(proxy_url)
-        return {"server": local_http}
-
-    result: dict = {"server": f"{scheme}{hostport}"}
-    if username:
-        result["username"] = username
-    if password:
-        result["password"] = password
-    return result
-
-
-# ─── 全局状态（记录已注册活动，按邮箱区分）────────────────────────────────────
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def get_account_state(state: dict, email: str) -> dict:
-    if email not in state:
-        state[email] = {"registered_events": [], "read_articles": [], "last_run": None}
-    # 兼容旧版没有 read_articles 字段的情况
-    if "read_articles" not in state[email]:
-        state[email]["read_articles"] = []
-    return state[email]
-
-
-# ─── 辅助工具 ─────────────────────────────────────────────────────────────────
-async def human_delay(min_s: float = 1.5, max_s: float = 4.0):
-    await asyncio.sleep(random.uniform(min_s, max_s))
-
-async def scroll_slowly(page: Page, steps: int = 5):
-    for _ in range(steps):
-        await page.mouse.wheel(0, random.randint(200, 500))
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-
-
-# ─── IMAP：从 Gmail 取 Magic Link ─────────────────────────────────────────────
-def fetch_magic_link(email: str, app_pass: str, timeout_sec: int = 90) -> str | None:
-    log.info(f"[{email}] IMAP: 等待 magic link（最多 {timeout_sec} 秒）...")
-    deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_sec)
-
-    while datetime.now(timezone.utc) < deadline:
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-            mail.login(email, app_pass)
-            mail.select("INBOX")
-
-            since = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%d-%b-%Y")
-
-            # 精确搜索
-            _, data = mail.search(None, f'(UNSEEN SINCE "{since}" FROM "circle")')
-            if not data or not data[0]:
-                _, data = mail.search(None, f'(UNSEEN SINCE "{since}")')
-
-            msg_ids = data[0].split() if data and data[0] else []
-
-            for msg_id in reversed(msg_ids):
-                _, msg_data = mail.fetch(msg_id, "(RFC822)")
-                raw = msg_data[0][1]
-                msg = email_lib.message_from_bytes(raw)
-
-                sender  = msg.get("From", "").lower()
-                subject = msg.get("Subject", "").lower()
-
-                if not any(kw in sender or kw in subject
-                           for kw in ["arc", "circle", "sign in", "login", "magic", "confirm"]):
-                    continue
-
-                # 提取正文
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() in ("text/plain", "text/html"):
-                            charset = part.get_content_charset() or "utf-8"
-                            body += part.get_payload(decode=True).decode(charset, errors="replace")
-                else:
-                    charset = msg.get_content_charset() or "utf-8"
-                    body = msg.get_payload(decode=True).decode(charset, errors="replace")
-
-                # 找 magic link
-                urls = re.findall(
-                    r'https?://[^\s"\'<>]+(?:magic|token|sign_in|confirm|auth)[^\s"\'<>]*',
-                    body,
-                )
-                if not urls:
-                    urls = re.findall(
-                        r'https?://(?:[^\s"\'<>]*arc\.network|[^\s"\'<>]*circle)[^\s"\'<>]*',
-                        body,
-                    )
-
-                if urls:
-                    link = urls[0].rstrip(".")
-                    log.info(f"[{email}] 找到 magic link")
-                    mail.store(msg_id, "+FLAGS", "\\Seen")
-                    mail.logout()
-                    return link
-
-            mail.logout()
-
-        except Exception as e:
-            log.warning(f"[{email}] IMAP 读取失败: {e}")
-
-        remaining = int((deadline - datetime.now(timezone.utc)).total_seconds())
-        log.info(f"[{email}] 未找到邮件，8秒后重试（剩余 {remaining}s）...")
-        time.sleep(8)
-
-    log.error(f"[{email}] 超时，未收到 magic link")
-    return None
-
-
-# ─── 读取积分 ─────────────────────────────────────────────────────────────────
-async def get_score(page: Page, email: str) -> int | None:
-    try:
-        # 尝试几个常见 profile 路径
-        profile_paths = ["/home/profile", "/home/member/profile", "/profile", "/home/account"]
-        navigated = False
-        for path in profile_paths:
-            try:
-                resp = await page.goto(f"{BASE_URL}{path}", wait_until="domcontentloaded", timeout=30000)
-                if resp and resp.status != 404:
-                    navigated = True
-                    break
-            except Exception:
-                continue
-        if not navigated:
-            log.warning(f"[{email}] 所有 profile 路径均 404，跳过积分读取")
+        if self.score_before is None or self.score_after is None:
             return None
-        await human_delay(2, 4)
-
-        # 尝试多种积分选择器
-        score_selectors = [
-            # 常见积分/点数显示
-            "[class*='point' i]",
-            "[class*='score' i]",
-            "[class*='credit' i]",
-            "[class*='reward' i]",
-            # 数字+文字组合
-            "span:has-text('points')",
-            "span:has-text('Points')",
-            "div:has-text('points')",
-            # 通用数字展示
-            "[class*='stat'] [class*='number']",
-            "[class*='badge'] [class*='count']",
-        ]
-
-        for sel in score_selectors:
-            try:
-                els = page.locator(sel)
-                count = await els.count()
-                for i in range(min(count, 5)):
-                    text = (await els.nth(i).text_content() or "").strip()
-                    # 提取数字
-                    nums = re.findall(r'\d[\d,]*', text.replace(",", ""))
-                    if nums:
-                        score = int(nums[0].replace(",", ""))
-                        if 0 < score < 1_000_000:
-                            log.info(f"[{email}] 当前积分: {score}")
-                            return score
-            except Exception:
-                continue
-
-        # 截图方便人工检查
-        await page.screenshot(path=str(LOG_DIR / f"profile_{email.split('@')[0]}.png"))
-        log.warning(f"[{email}] 未能自动读取积分，已截图")
-        return None
-
-    except Exception as e:
-        log.warning(f"[{email}] 读取积分失败: {e}")
-        return None
+        return self.score_after - self.score_before
 
 
-# ─── 辅助：判断当前页面是否已登录 ───────────────────────────────────────────
-async def is_logged_in(page: Page) -> bool:
-    """检查当前页面是否处于登录态（不在 sign_in / 404 页）"""
-    url = page.url
-    if "sign_in" in url or "login" in url.lower():
-        return False
-    # 检查是否存在登出按钮 / 用户头像 / 用户菜单（表示已登录）
-    logged_in_selectors = [
-        "[class*='avatar' i]",
-        "[class*='user-menu' i]",
-        "button:has-text('Sign out')",
-        "a:has-text('Sign out')",
-        "button:has-text('Log out')",
-        "[data-testid*='user']",
-        "[aria-label*='profile' i]",
-        "[class*='profile' i]",
-    ]
-    for sel in logged_in_selectors:
-        try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
-                return True
-        except Exception:
-            continue
-    # 如果 URL 不含 sign_in 且不是 404，也认为登录成功
-    if "sign_in" not in url and "404" not in url and url != BASE_URL + "/":
-        return True
-    return False
-
-
-# ─── 登录 ─────────────────────────────────────────────────────────────────────
-async def login(page: Page, account: Account) -> bool:
-    log.info(f"[{account.email}] 开始登录（Magic Link）...")
-    await page.goto(f"{BASE_URL}/home/sign_in", wait_until="domcontentloaded", timeout=60000)
-    await human_delay(3, 5)
-
-    email_input = page.locator(
-        "input[type='email'], input[name='email'], input[placeholder*='email' i]"
-    ).first
-    await email_input.wait_for(state="visible", timeout=60000)
-    await email_input.fill(account.email)
-    await human_delay(0.8, 1.5)
-
-    submit = page.locator(
-        "button[type='submit'], button:has-text('Sign in'), "
-        "button:has-text('Log in'), button:has-text('Continue'), button:has-text('Send')"
-    ).first
-    await submit.click()
-    log.info(f"[{account.email}] 已提交邮箱，等待确认邮件...")
-    await human_delay(3, 5)
-
-    magic_link = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: fetch_magic_link(account.email, account.app_pass, timeout_sec=90)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run Arc Network daily automation tasks.",
     )
-
-    if not magic_link:
-        await page.screenshot(path=str(LOG_DIR / f"login_failed_{account.email.split('@')[0]}.png"))
-        return False
-
-    log.info(f"[{account.email}] magic link: {magic_link}")
-    resp = await page.goto(magic_link, wait_until="domcontentloaded", timeout=60000)
-    # 等待 cookie / session 写入稳定
-    await human_delay(3, 5)
-
-    # magic link 落地页可能是 404（token 已消耗，但 cookie 已写入）
-    # 无论 404 与否，都跳转到 /home 继续
-    if resp and resp.status == 404:
-        log.warning(f"[{account.email}] magic link 落地页 404（正常），等待 session 写入后跳转...")
-        await asyncio.sleep(3)  # 额外等待确保 cookie 写入
-        await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
-        await human_delay(3, 5)
-    else:
-        # 落地页正常，等待可能的自动跳转
-        try:
-            await page.wait_for_url(
-                lambda u: "sign_in" not in u and "magic" not in u.lower(),
-                timeout=10000,
-            )
-        except Exception:
-            pass
-        await human_delay(2, 3)
-
-    # 页面上可能有一个"确认登录"按钮需要点击
-    confirm_selectors = [
-        "button:has-text('Confirm')",
-        "button:has-text('Sign in')",
-        "button:has-text('Log in')",
-        "button:has-text('Continue')",
-        "a:has-text('Confirm')",
-        "a:has-text('Sign in')",
-    ]
-    for sel in confirm_selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=3000):
-                log.info(f"[{account.email}] 点击确认按钮: {sel}")
-                await btn.click()
-                await human_delay(3, 5)
-                break
-        except Exception:
-            continue
-
-    # 如果还在登录页，主动跳转到 /home
-    current_url = page.url
-    if "sign_in" in current_url or "magic" in current_url.lower():
-        log.warning(f"[{account.email}] 仍在登录页，主动跳转 /home...")
-        await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
-        await human_delay(3, 5)
-
-    # 截图记录当前页面状态
-    screenshot_path = str(SCRIPT_DIR / f"login_result_{account.email.split('@')[0]}.png")
-    await page.screenshot(path=screenshot_path)
-
-    current_url = page.url
-    log.info(f"[{account.email}] 登录后 URL: {current_url}")
-
-    # 验证登录态
-    logged_in = await is_logged_in(page)
-    if logged_in:
-        log.info(f"[{account.email}] 登录成功 ✓")
-        return True
-    else:
-        log.error(f"[{account.email}] 登录失败，已截图: {screenshot_path}")
-        return False
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Run all configured accounts once and exit (default).",
+    )
+    mode_group.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run continuously with a 24 hour interval between runs.",
+    )
+    mode_group.add_argument(
+        "--setup",
+        action="store_true",
+        help="Install Python dependencies, install Chromium, and review local config files.",
+    )
+    mode_group.add_argument(
+        "--setup-cron",
+        action="store_true",
+        help="Install a cron entry that runs this script with --run-once.",
+    )
+    parser.add_argument(
+        "--account",
+        help="Run only the exact email address listed in the local account configuration.",
+    )
+    parser.add_argument(
+        "--headful",
+        action="store_true",
+        help="Launch Chromium in headful mode for debugging.",
+    )
+    parser.add_argument(
+        "--cron-schedule",
+        default=DEFAULT_CRON_SCHEDULE,
+        help=(
+            "Cron schedule used by --setup-cron. Default: "
+            f"{DEFAULT_CRON_SCHEDULE!r} with CRON_TZ=Asia/Ho_Chi_Minh."
+        ),
+    )
+    parser.add_argument(
+        "--interval-hours",
+        type=float,
+        default=DEFAULT_DAEMON_INTERVAL_HOURS,
+        help="Loop interval used by --daemon. Default: 24 hours.",
+    )
+    return parser
 
 
-# ─── 任务 1 & 2：阅读文章 + 观看视频 ─────────────────────────────────────────
-async def read_content(page: Page, email: str, acct_state: dict) -> dict:
-    log.info(f"[{email}] === 任务1&2：Content 阅读文章 + 视频 ===")
-    await page.goto(f"{BASE_URL}/home/content", wait_until="domcontentloaded")
-    await human_delay(3, 5)
-
-    articles_read = 0
-    videos_watched = 0
-    TARGET_ARTICLES = 5
-    TARGET_VIDEOS   = 1
-
-    # 已读记录（按邮箱隔离，持久化在 arc_state.json）
-    read_history: list = acct_state.get("read_articles", [])
-
-    # 直接获取内容链接，不等待 visible（导航栏也有 /home/ 链接会导致 wait_for_selector 超时）
-    links = await page.locator(
-        "a[href*='/home/blogs/'], a[href*='/home/externals/'], a[href*='/home/videos/'], "
-        "a[href*='/home/content/'], a[href*='/home/posts/'], a[href*='/home/articles/']"
-    ).all()
-
-    # 如果专用选择器没找到内容，降级用所有 /home/ 下的链接（过滤掉导航项）
-    if len(links) == 0:
-        all_links = await page.locator("a[href*='/home/']").all()
-        nav_keywords = ["sign_in", "sign_out", "profile", "settings", "events", "forum",
-                        "content", "notifications", "members", "leaderboard"]
-        links = [
-            lnk for lnk in all_links
-            if not any(kw in (await lnk.get_attribute("href") or "") for kw in nav_keywords)
-        ]
-        log.info(f"[{email}] 降级模式：过滤后得到 {len(links)} 个内容链接")
-
-    hrefs = []
-    for lnk in links:
-        href = await lnk.get_attribute("href")
-        if href and href not in hrefs:
-            hrefs.append(href)
-
-    log.info(f"[{email}] 发现 {len(hrefs)} 个内容链接")
-
-    # 过滤掉已读过的文章（视频不做去重，数量少）
-    new_hrefs  = [h for h in hrefs if h not in read_history or "/videos/" in h]
-    skip_count = len(hrefs) - len(new_hrefs)
-    if skip_count > 0:
-        log.info(f"[{email}] 跳过已读文章 {skip_count} 篇，剩余新内容 {len(new_hrefs)} 篇")
-
-    # 如果新内容不够 5 篇，把已读的也补进来（保证任务能完成）
-    if len(new_hrefs) < TARGET_ARTICLES:
-        already_read = [h for h in hrefs if h in read_history and "/videos/" not in h]
-        needed = TARGET_ARTICLES - len(new_hrefs)
-        new_hrefs += already_read[:needed]
-        if already_read:
-            log.info(f"[{email}] 新内容不足，补充 {min(needed, len(already_read))} 篇旧文章凑够任务数")
-
-    random.shuffle(new_hrefs)
-
-    for href in new_hrefs:
-        if articles_read >= TARGET_ARTICLES and videos_watched >= TARGET_VIDEOS:
-            break
-
-        is_video = "/videos/" in href
-        if is_video and videos_watched >= TARGET_VIDEOS:
-            continue
-        if not is_video and articles_read >= TARGET_ARTICLES:
-            continue
-
-        url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await human_delay(1, 2)
-            await scroll_slowly(page, steps=random.randint(4, 8))
-            read_time = random.uniform(15, 30)
-            log.info(f"[{email}]   阅读中（{read_time:.0f}s）: {url.split('/')[-1][:50]}")
-            await asyncio.sleep(read_time)
-
-            if is_video:
-                videos_watched += 1
-            else:
-                articles_read += 1
-                # 记录已读（用规范化的 href 存储，避免 http/https 差异）
-                if href not in read_history:
-                    read_history.append(href)
-                    acct_state["read_articles"] = read_history
-
-            await page.go_back()
-            await human_delay(2, 4)
-        except Exception as e:
-            log.warning(f"[{email}]   跳过: {e}")
-
-    log.info(f"[{email}] Content 完成：文章 {articles_read}/{TARGET_ARTICLES}，视频 {videos_watched}/{TARGET_VIDEOS}，累计已读 {len(read_history)} 篇")
-    return {"articles": articles_read, "videos": videos_watched}
-
-
-# ─── 任务 3：Events 注册 ──────────────────────────────────────────────────────
-async def register_events(page: Page, email: str, acct_state: dict) -> int:
-    log.info(f"[{email}] === 任务3：Events 注册新活动 ===")
-    await page.goto(f"{BASE_URL}/home/events", wait_until="domcontentloaded")
-    await human_delay(2, 3)
-
-    registered_count = 0
-
+async def run_once(args: argparse.Namespace) -> int:
     try:
-        upcoming_btn = page.locator("button:has-text('Upcoming')").first
-        if await upcoming_btn.is_visible():
-            await upcoming_btn.click()
-            await human_delay(1, 2)
-    except Exception:
-        pass
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise ConfigError(
+            "Playwright is not installed. Run `pip install -r requirements.txt` "
+            "and `python -m playwright install chromium` before starting a run."
+        ) from exc
 
-    register_btns = page.locator("button:has-text('Register')")
-    count = await register_btns.count()
-    log.info(f"[{email}] 发现 {count} 个 Register 按钮")
+    log.info("=" * 68)
+    log.info("Arc daily run started at %s", datetime.now().isoformat(sep=" ", timespec="seconds"))
+    log.info("Logging to %s", log_file.name)
+    log.info("Browser mode: %s", "headful" if args.headful else "headless")
+    log.info("=" * 68)
 
-    for i in range(count):
-        btn = register_btns.nth(i)
-        try:
-            card = btn.locator("xpath=ancestor::div[contains(@class,'CardContainer') or contains(@class,'card')]").first
-            title_el = card.locator("h3, h2").first
-            title = (await title_el.text_content() if await title_el.count() > 0 else f"Event_{i}").strip()
+    accounts = load_runtime_accounts(log, selected_email=args.account)
+    state = load_state(STATE_FILE, log)
+    results: list[AccountResult] = []
 
-            if title in acct_state["registered_events"]:
-                log.info(f"[{email}]   跳过（已注册）: {title}")
-                continue
-
-            log.info(f"[{email}]   注册: {title}")
-            try:
-                await btn.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-            await human_delay(1, 2)
-            await btn.click()
-            await human_delay(2, 4)
-
-            for sel in ["button:has-text('Confirm')", "button:has-text('Submit')", "button:has-text('OK')"]:
-                try:
-                    cb = page.locator(sel).last
-                    if await cb.is_visible(timeout=3000):
-                        await cb.click()
-                        await human_delay(1, 2)
-                        break
-                except Exception:
-                    pass
-
-            try:
-                close_btn = page.locator("button[aria-label='Close'], [class*='close']").first
-                if await close_btn.is_visible(timeout=2000):
-                    await close_btn.click()
-                    await human_delay(1, 2)
-            except Exception:
-                pass
-
-            acct_state["registered_events"].append(title)
-            registered_count += 1
-            log.info(f"[{email}]   注册成功 (+5分): {title}")
-            await page.keyboard.press("Escape")
-            await human_delay(2, 3)
-
-        except Exception:
-            pass  # 按钮超时/不可点击，静默跳过
-
-    log.info(f"[{email}] Events 完成：注册 {registered_count} 个活动 (+{registered_count*5}分)")
-    return registered_count
-
-
-# ─── 任务 4：发帖 ─────────────────────────────────────────────────────────────
-async def find_forum_url(page: Page, email: str) -> str:
-    """尝试从导航栏找到 forum/discussions 的真实路径"""
-    forum_url = f"{BASE_URL}/home/forum"  # 默认猜测
-    try:
-        nav_links = await page.locator("nav a, aside a, [class*='sidebar'] a, [class*='nav'] a").all()
-        for lnk in nav_links:
-            href = (await lnk.get_attribute("href") or "").lower()
-            text = (await lnk.text_content() or "").lower().strip()
-            if any(kw in text or kw in href for kw in ["forum", "discussion", "discuss", "community", "post"]):
-                full = href if href.startswith("http") else f"{BASE_URL}{href}"
-                log.info(f"[{email}] 找到 forum 链接: {full}")
-                return full
-    except Exception as e:
-        log.warning(f"[{email}] 自动查找 forum 链接失败: {e}")
-    log.info(f"[{email}] 使用默认 forum URL: {forum_url}")
-    return forum_url
-
-
-async def create_post(page: Page, email: str) -> bool:
-    log.info(f"[{email}] === 任务4：Discussions 发帖 ===")
-    forum_url = await find_forum_url(page, email)
-    await page.goto(forum_url, wait_until="domcontentloaded")
-    await human_delay(3, 5)
-
-    try:
-        await page.wait_for_selector(
-            "button:has-text('Create a post'), button:has-text('New post')",
-            timeout=10000,
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=not args.headful,
+            args=RUNTIME_BROWSER_ARGS,
         )
-    except Exception:
-        log.warning(f"[{email}] 未找到发帖按钮（继续尝试）")
-
-    try:
-        create_btn = page.locator(
-            "button:has-text('Create a post'), button:has-text('New post'), a:has-text('Create a post')"
-        ).first
         try:
-            await create_btn.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
-            pass
-        await human_delay(1, 2)
-        await create_btn.click(timeout=8000)
-        await human_delay(2, 3)
+            for index, account in enumerate(accounts, start=1):
+                account_key = account_id(account.email)
+                log.info("%s", "-" * 68)
+                log.info("Account %d/%d: %s", index, len(accounts), account_key)
+                log.info("%s", "-" * 68)
 
-        # 标题
-        title_input = page.locator("input[placeholder*='title' i], input[name='title']").first
-        if await title_input.is_visible(timeout=5000):
-            today_str = datetime.now().strftime("%B %d")
-            await title_input.fill(f"Daily Discussion – {today_str}")
-            await human_delay(0.5, 1.5)
+                result = await run_account(account, browser, state)
+                results.append(result)
+                save_state(state, STATE_FILE, log)
 
-        # 正文（每个账号用不同模板）
-        post_text = random.choice(POST_TEMPLATES)
-        body_filled = False
-        for sel in ["div[contenteditable='true']", "textarea", ".ql-editor", "div[role='textbox']"]:
-            try:
-                body = page.locator(sel).first
-                if await body.is_visible(timeout=4000):
-                    await body.click()
-                    await human_delay(0.5, 1)
-                    await body.fill(post_text)
-                    body_filled = True
-                    break
-            except Exception:
-                continue
+                if index < len(accounts):
+                    wait_seconds = random.randint(30, 90)
+                    log.info("Waiting %d seconds before the next account", wait_seconds)
+                    await asyncio.sleep(wait_seconds)
+        finally:
+            await browser.close()
 
-        if not body_filled:
-            log.warning(f"[{email}] 未能填写正文，跳过发帖")
-            await page.keyboard.press("Escape")
-            return False
+    summary_text = build_summary_text(results)
+    print(summary_text)
+    log.info(
+        "Summary complete for %d account(s). Known total gain: %s",
+        len(results),
+        _format_gain(_known_total_gain(results)),
+    )
+    _send_summary_notification(summary_text)
+    return 1 if any(result.error for result in results) else 0
 
-        await human_delay(1, 2)
 
-        submitted = False
-        for sel in ["button:has-text('Post')", "button:has-text('Publish')", "button:has-text('Submit')", "button[type='submit']"]:
-            try:
-                sb = page.locator(sel).last
-                if await sb.is_visible(timeout=3000):
-                    await sb.click()
-                    submitted = True
-                    break
-            except Exception:
-                continue
+async def run_daemon(args: argparse.Namespace) -> int:
+    log.info("=" * 68)
+    log.info("Arc daemon started at %s", datetime.now().isoformat(sep=" ", timespec="seconds"))
+    log.info("Daemon interval: %.2f hours", args.interval_hours)
+    log.info("=" * 68)
 
-        if submitted:
-            await human_delay(3, 5)
-            log.info(f"[{email}] 发帖成功 (+10分)")
-            return True
-        else:
-            log.warning(f"[{email}] 未找到提交按钮")
-            await page.keyboard.press("Escape")
-            return False
+    run_count = 0
+    interval_seconds = max(1, int(args.interval_hours * 3600))
 
-    except Exception as e:
-        log.error(f"[{email}] 发帖失败: {e}")
-        await page.screenshot(path=str(LOG_DIR / f"post_failed_{email.split('@')[0]}.png"))
+    while True:
+        run_count += 1
+        started_at = datetime.now()
+        log.info("%s", "=" * 68)
+        log.info("Daemon cycle %d started at %s", run_count, started_at.strftime("%Y-%m-%d %H:%M:%S"))
+        log.info("%s", "=" * 68)
+
         try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return False
+            await run_once(args)
+        except Exception as exc:
+            log.error("Daemon cycle %d failed: %s", run_count, safe_exception_message(exc))
+
+        finished_at = datetime.now()
+        elapsed_seconds = int((finished_at - started_at).total_seconds())
+        wait_seconds = max(0, interval_seconds - elapsed_seconds)
+        next_run = finished_at + timedelta(seconds=wait_seconds)
+
+        log.info("Daemon cycle %d finished in %.1f minutes", run_count, elapsed_seconds / 60)
+        log.info("Next run scheduled for %s", next_run.strftime("%Y-%m-%d %H:%M:%S"))
+        log.info("Sleeping for %.2f hours", wait_seconds / 3600)
+
+        await asyncio.sleep(wait_seconds)
 
 
-# ─── 任务 5：评论 ─────────────────────────────────────────────────────────────
-async def comment_on_posts(page: Page, email: str) -> int:
-    log.info(f"[{email}] === 任务5：Discussions 评论 2 条帖子 ===")
-    forum_url = await find_forum_url(page, email)
-    await page.goto(forum_url, wait_until="domcontentloaded")
-    await human_delay(3, 5)
+async def run_account(account: Account, browser: Any, state: dict[str, Any]) -> AccountResult:
+    from auth import is_logged_in, login
+    from browser_utils import capture_debug_screenshot, human_delay, parse_proxy
+    from tasks import comment_on_posts, create_post, get_score, read_content, register_events
 
-    commented    = 0
-    TARGET       = 2
-    post_link_sel = "a[href*='/home/forum/'], a[href*='/home/post/'], a[href*='/home/discussion']"
+    account_key = account_id(account.email)
+    result = AccountResult(account_key=account_key)
+    staged_state = clone_account_state(state, account_key, legacy_keys=[account.email])
+    storage_file = session_path(account.email)
 
-    try:
-        await page.wait_for_selector(post_link_sel, timeout=10000)
-    except Exception:
-        log.warning(f"[{email}] 帖子列表未加载（继续尝试）")
+    context = None
+    page = None
 
-    post_links = await page.locator(post_link_sel).all()
-    hrefs = []
-    for lnk in post_links:
-        href = await lnk.get_attribute("href")
-        if href and href not in hrefs:
-            hrefs.append(href)
-
-    log.info(f"[{email}] 发现 {len(hrefs)} 个帖子")
-    # 跳过前1个（可能是自己刚发的），多取几个备用
-    target_posts = hrefs[1:TARGET + 4] if len(hrefs) > 1 else hrefs
-
-    for href in target_posts:
-        if commented >= TARGET:
-            break
-
-        url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await human_delay(2, 4)
-            await scroll_slowly(page, steps=3)
-
-            comment_text = random.choice(COMMENT_TEMPLATES)
-            comment_filled = False
-
-            comment_sels = [
-                "div[contenteditable='true']",
-                "textarea[placeholder*='comment' i]",
-                ".ql-editor",
-                "div[role='textbox']",
-            ]
-
-            # 先尝试直接找输入框
-            for sel in comment_sels:
-                try:
-                    cb = page.locator(sel).first
-                    if await cb.is_visible(timeout=4000):
-                        await cb.click()
-                        await human_delay(0.5, 1)
-                        await cb.fill(comment_text)
-                        comment_filled = True
-                        break
-                except Exception:
-                    continue
-
-            # 若没找到，尝试点击触发按钮
-            if not comment_filled:
-                try:
-                    trigger = page.locator(
-                        "button:has-text('Add a comment'), button:has-text('Comment'), button:has-text('Reply')"
-                    ).first
-                    if await trigger.is_visible(timeout=4000):
-                        await trigger.click()
-                        await human_delay(1, 2)
-                        for sel in comment_sels:
-                            try:
-                                cb = page.locator(sel).first
-                                if await cb.is_visible(timeout=3000):
-                                    await cb.fill(comment_text)
-                                    comment_filled = True
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
-
-            if not comment_filled:
-                log.warning(f"[{email}]   未找到评论框，跳过")
-                await page.go_back()
-                await human_delay(2, 3)
-                continue
-
-            await human_delay(1, 2)
-
-            submitted = False
-            for sel in ["button:has-text('Post')", "button:has-text('Submit')", "button:has-text('Reply')", "button:has-text('Send')", "button[type='submit']"]:
-                try:
-                    sb = page.locator(sel).last
-                    if await sb.is_visible(timeout=3000):
-                        await sb.click()
-                        submitted = True
-                        break
-                except Exception:
-                    continue
-
-            if submitted:
-                await human_delay(3, 5)
-                commented += 1
-                log.info(f"[{email}]   评论 {commented}/{TARGET} 成功")
-            else:
-                log.warning(f"[{email}]   未找到提交按钮")
-
-            await page.go_back()
-            await human_delay(2, 4)
-
-        except Exception as e:
-            log.error(f"[{email}] 评论失败 {url}: {e}")
-            try:
-                await page.go_back()
-            except Exception:
-                pass
-            await human_delay(2, 3)
-
-    log.info(f"[{email}] 评论完成：{commented}/{TARGET} 条 (+{commented*5}分)")
-    return commented
-
-
-# ─── 单账号完整流程 ────────────────────────────────────────────────────────────
-async def run_account(account: Account, browser: Browser, state: dict) -> AccountResult:
-    result = AccountResult(email=account.email)
-    acct_state = get_account_state(state, account.email)
-
-    # session 文件路径（按邮箱前缀命名）
-    session_file = SESSIONS_DIR / f"{account.email.split('@')[0]}.json"
-
-    ctx_kwargs: dict = dict(
-        viewport={"width": 1366, "height": 768},
-        user_agent=(
+    context_options: dict[str, Any] = {
+        "viewport": {"width": 1366, "height": 768},
+        "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/123.0.0.0 Safari/537.36"
         ),
-        locale="en-US",
-    )
+        "locale": "en-US",
+    }
+
     if account.proxy:
-        ctx_kwargs["proxy"] = parse_proxy(account.proxy)
-        log.info(f"[{account.email}] 使用代理: {account.proxy.split('@')[-1]}")
-
-    # 如果有保存的 session，先尝试直接加载
-    session_ok = False
-    if session_file.exists():
-        log.info(f"[{account.email}] 发现已保存的 session，尝试直接使用...")
-        try:
-            ctx_kwargs["storage_state"] = str(session_file)
-            context: BrowserContext = await browser.new_context(**ctx_kwargs)
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
-            page = await context.new_page()
-            await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=30000)
-            await human_delay(2, 3)
-
-            if await is_logged_in(page):
-                log.info(f"[{account.email}] Session 有效，跳过登录 ✓")
-                session_ok = True
-            else:
-                log.warning(f"[{account.email}] Session 已过期，需要重新登录")
-                await context.close()
-                del ctx_kwargs["storage_state"]
-                session_file.unlink(missing_ok=True)
-        except Exception as e:
-            log.warning(f"[{account.email}] 加载 session 失败: {e}，重新登录")
-            try:
-                await context.close()
-            except Exception:
-                pass
-            ctx_kwargs.pop("storage_state", None)
-            session_file.unlink(missing_ok=True)
-            session_ok = False
-
-    # 没有有效 session，走正常登录流程
-    if not session_ok:
-        ctx_kwargs.pop("storage_state", None)
-        context: BrowserContext = await browser.new_context(**ctx_kwargs)
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        page = await context.new_page()
-
-        if not await login(page, account):
-            result.error = "登录失败"
-            await context.close()
-            return result
-
-        # 登录成功后保存 session
-        try:
-            await context.storage_state(path=str(session_file))
-            log.info(f"[{account.email}] Session 已保存 → {session_file.name}")
-        except Exception as e:
-            log.warning(f"[{account.email}] 保存 session 失败: {e}")
+        context_options["proxy"] = parse_proxy(account.proxy, log)
+        log.info("[%s] Using proxy: %s", account_key, describe_proxy(account.proxy))
 
     try:
-        # 读取任务前积分
-        result.score_before = await get_score(page, account.email)
+        context, page, using_saved_session = await _open_account_context(
+            browser,
+            account,
+            context_options,
+            storage_file,
+            is_logged_in,
+        )
 
-        # 执行任务
-        content_result   = await read_content(page, account.email, acct_state)
+        if using_saved_session:
+            log.info("[%s] Using saved browser session", account_key)
+        else:
+            try:
+                await login(page, account, log, account_key)
+            except Exception as exc:
+                result.error = safe_exception_message(exc)
+                log.error("[%s] Login failed: %s", account_key, result.error)
+                return result
+            await _save_browser_session(context, account_key, storage_file, "Saved browser session")
+
+        result.score_before = await _run_step(
+            account_key,
+            "score check before tasks",
+            lambda: get_score(page, account_key, log),
+            None,
+        )
+
+        content_result = await _run_step(
+            account_key,
+            "content tasks",
+            lambda: read_content(page, account_key, staged_state, log),
+            {"articles": 0, "videos": 0},
+        )
         await human_delay(3, 6)
 
-        events_count     = await register_events(page, account.email, acct_state)
+        event_count = await _run_step(
+            account_key,
+            "event registration task",
+            lambda: register_events(page, account_key, staged_state, log),
+            0,
+        )
         await human_delay(3, 6)
 
-        post_ok          = await create_post(page, account.email)
+        post_created = await _run_step(
+            account_key,
+            "post creation task",
+            lambda: create_post(page, account_key, log),
+            False,
+        )
         await human_delay(3, 6)
 
-        comment_count    = await comment_on_posts(page, account.email)
+        comment_count = await _run_step(
+            account_key,
+            "comment task",
+            lambda: comment_on_posts(page, account_key, log),
+            0,
+        )
 
         result.tasks_done = {
-            "articles":  content_result["articles"],
-            "videos":    content_result["videos"],
-            "events":    events_count,
-            "post":      post_ok,
-            "comments":  comment_count,
+            "articles": content_result.get("articles", 0),
+            "videos": content_result.get("videos", 0),
+            "events": event_count,
+            "post": post_created,
+            "comments": comment_count,
         }
 
-        # 读取任务后积分
         await human_delay(3, 6)
-        result.score_after = await get_score(page, account.email)
+        result.score_after = await _run_step(
+            account_key,
+            "score check after tasks",
+            lambda: get_score(page, account_key, log),
+            None,
+        )
 
-        acct_state["last_run"] = datetime.now().isoformat()
-
-        # 任务完成后刷新保存 session（保持最新 cookie）
-        try:
-            await context.storage_state(path=str(session_file))
-            log.info(f"[{account.email}] Session 已更新")
-        except Exception as e:
-            log.warning(f"[{account.email}] 更新 session 失败: {e}")
-
-    except Exception as e:
-        result.error = str(e)
-        log.error(f"[{account.email}] 账号异常: {e}", exc_info=True)
-        await page.screenshot(path=str(LOG_DIR / f"error_{account.email.split('@')[0]}.png"))
+        staged_state["last_run"] = datetime.now().isoformat()
+        commit_account_state(state, account_key, staged_state, legacy_keys=[account.email])
+        await _save_browser_session(context, account_key, storage_file, "Updated browser session")
+    except Exception as exc:
+        result.error = safe_exception_message(exc)
+        log.error("[%s] Account run failed: %s", account_key, result.error)
+        if page is not None:
+            await capture_debug_screenshot(page, "error", account_key, log)
     finally:
-        await context.close()
+        if context is not None:
+            await context.close()
 
     return result
 
 
-# ─── 汇总报告 ─────────────────────────────────────────────────────────────────
-def print_summary(results: list[AccountResult]):
-    sep = "=" * 70
-    print(f"\n{sep}")
-    print(f"  Arc Network 每日积分汇总  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(sep)
+def build_summary_text(results: list[AccountResult]) -> str:
+    separator = "=" * 76
+    lines = ["", separator, f"Arc Daily Summary | {datetime.now().strftime('%Y-%m-%d %H:%M')}", separator]
 
-    total_gained = 0
-    for r in results:
-        status = "✓" if not r.error else "✗"
-        before = f"{r.score_before:,}" if r.score_before is not None else "N/A"
-        after  = f"{r.score_after:,}"  if r.score_after  is not None else "N/A"
-        gained = r.gained()
-        gained_str = f"+{gained}" if gained is not None else "N/A"
-        if gained:
-            total_gained += gained
+    for result in results:
+        gained = result.gained()
 
-        print(f"\n  [{status}] {r.email}")
-        if r.error:
-            print(f"      错误: {r.error}")
-        else:
-            print(f"      积分: {before} → {after}  （{gained_str}）")
-            td = r.tasks_done
-            print(f"      任务: 文章 {td.get('articles',0)}/5  "
-                  f"视频 {td.get('videos',0)}/1  "
-                  f"活动 {td.get('events',0)}个  "
-                  f"发帖 {'✓' if td.get('post') else '✗'}  "
-                  f"评论 {td.get('comments',0)}/2")
+        status = "OK" if not result.error else "FAILED"
+        lines.append("")
+        lines.append(f"[{status}] {result.account_key}")
+        if result.error:
+            lines.append(f"  Error       : {result.error}")
+            continue
 
-    print(f"\n{sep}")
-    print(f"  共 {len(results)} 个账号  |  本次合计积分: +{total_gained}")
-    print(sep)
-
-    # 同时写入日志
-    log.info(f"汇总：{len(results)} 个账号，合计 +{total_gained} 积分")
-
-
-# ─── 单次执行所有账号 ──────────────────────────────────────────────────────────
-async def run_once():
-    log.info("=" * 60)
-    log.info(f"Arc Network 每日任务开始  {datetime.now()}")
-    log.info("=" * 60)
-
-    accounts = load_accounts()
-    passes   = load_gmail_passes(len(accounts))
-    proxies  = load_proxies(len(accounts))
-    for account, app_pass, proxy in zip(accounts, passes, proxies):
-        account.app_pass = app_pass
-        account.proxy    = proxy
-
-    state   = load_state()
-    results = []
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-            ],
+        tasks = result.tasks_done
+        lines.append(f"  Score before: {_format_score(result.score_before)}")
+        lines.append(f"  Score after : {_format_score(result.score_after)}")
+        lines.append(f"  Gained      : {_format_gain(gained)}")
+        lines.append(
+            "  Tasks       : "
+            f"Articles {tasks.get('articles', 0)}/5 | "
+            f"Videos {tasks.get('videos', 0)}/1 | "
+            f"Events {tasks.get('events', 0)} | "
+            f"Post {'yes' if tasks.get('post') else 'no'} | "
+            f"Comments {tasks.get('comments', 0)}/2"
         )
 
-        # 账号依次串行执行（避免同时多个浏览器触发反爬）
-        for i, account in enumerate(accounts, 1):
-            log.info(f"\n{'─'*60}")
-            log.info(f"账号 {i}/{len(accounts)}: {account.email}")
-            log.info(f"{'─'*60}")
-
-            result = await run_account(account, browser, state)
-            results.append(result)
-            save_state(state)
-
-            # 账号之间随机间隔 30-90 秒
-            if i < len(accounts):
-                wait = random.randint(30, 90)
-                log.info(f"等待 {wait} 秒后处理下一个账号...")
-                await asyncio.sleep(wait)
-
-        await browser.close()
-
-    print_summary(results)
+    lines.append("")
+    lines.append(separator)
+    lines.append(f"Accounts      : {len(results)}")
+    lines.append(f"Known gain    : {_format_gain(_known_total_gain(results))}")
+    lines.append(separator)
+    return "\n".join(lines)
 
 
-# ─── 主循环：每隔 24 小时在同一时间点重复执行 ──────────────────────────────────
-async def main():
-    log.info("=" * 60)
-    log.info(f"Arc Network 守护进程启动  {datetime.now()}")
-    log.info(f"将在每次执行完成后等待 24 小时再次运行")
-    log.info("=" * 60)
-
-    run_count = 0
-    INTERVAL  = 24 * 60 * 60  # 24 小时（秒）
-
-    while True:
-        run_count += 1
-        start_time = datetime.now()
-        log.info(f"\n{'━'*60}")
-        log.info(f"第 {run_count} 次执行  {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        log.info(f"{'━'*60}")
-
-        try:
-            await run_once()
-        except Exception as e:
-            log.error(f"本轮执行异常: {e}", exc_info=True)
-
-        end_time  = datetime.now()
-        elapsed   = (end_time - start_time).total_seconds()
-        wait_secs = max(0, INTERVAL - elapsed)
-
-        next_run  = end_time + timedelta(seconds=wait_secs)
-        log.info(f"\n本轮耗时 {elapsed/60:.1f} 分钟")
-        log.info(f"下次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-        log.info(f"等待 {wait_secs/3600:.2f} 小时...")
-
-        await asyncio.sleep(wait_secs)
-
-
-# ─── 首次部署：安装依赖 + Chromium + 配置 cron ───────────────────────────────
-def setup():
-    import subprocess
+def setup_environment() -> None:
     import platform
 
-    print("=" * 60)
-    print("  Arc Network 脚本 — 首次部署向导")
-    print("=" * 60)
+    ensure_config_templates()
 
-    # 1. 安装 playwright
-    print("\n[1/3] 安装 playwright...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "-q"], check=True)
-
-    # 2. 安装 Chromium
-    print("[2/3] 安装 Chromium 浏览器...")
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-    # Linux 上额外安装系统依赖
+    steps: list[tuple[str, list[str]]] = [
+        (
+            "Install Python packages from requirements.txt",
+            [sys.executable, "-m", "pip", "install", "-r", str(SCRIPT_DIR / "requirements.txt")],
+        ),
+        (
+            "Install Chromium for Playwright",
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+        ),
+    ]
     if platform.system() == "Linux":
-        subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True)
-
-    # 3. 校验配置文件存在
-    print("[3/3] 检查配置文件...")
-    for fname, hint in [
-        (ACCOUNTS_FILE,     "填写每行一个 Arc 登录邮箱"),
-        (GMAIL_PASSES_FILE, "填写每行一个 Gmail 应用专用密码（与邮箱行对应）"),
-        (PROXIES_FILE,      "填写每行一个代理（与邮箱行对应）"),
-    ]:
-        if not fname.exists() or all(
-            l.strip().startswith("#") or not l.strip()
-            for l in fname.read_text(encoding="utf-8").splitlines()
-        ):
-            print(f"  ⚠  {fname.name} 尚未填写有效内容 — 请{hint}")
-        else:
-            lines = [l for l in fname.read_text(encoding="utf-8").splitlines()
-                     if l.strip() and not l.strip().startswith("#")]
-            print(f"  ✓  {fname.name} — {len(lines)} 条记录")
-
-    # 4. 配置 cron（仅 Linux/macOS）
-    if platform.system() in ("Linux", "Darwin"):
-        python_bin = sys.executable
-        script_path = Path(__file__).resolve()
-        log_path = LOG_DIR / "arc_cron.log"
-        cron_job = f"0 9 * * * {python_bin} {script_path} >> {log_path} 2>&1"
-
-        try:
-            result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-            existing = result.stdout if result.returncode == 0 else ""
-            if str(script_path) in existing:
-                print(f"\n  ✓  Cron 任务已存在，跳过")
-            else:
-                new_crontab = existing.rstrip("\n") + "\n" + cron_job + "\n"
-                subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
-                print(f"\n  ✓  Cron 已配置（每天 UTC 09:00）: {cron_job}")
-        except FileNotFoundError:
-            print("\n  ℹ  未找到 crontab 命令，请手动配置定时任务")
-    else:
-        print(
-            f"\n  ℹ  Windows 请使用「任务计划程序」设置每日定时运行：\n"
-            f"     {sys.executable} {Path(__file__).resolve()}"
+        steps.append(
+            (
+                "Install Linux browser dependencies for Chromium",
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+            )
         )
 
-    print("\n" + "=" * 60)
-    print("  部署完成！确认配置文件填写正确后运行：")
-    print(f"  python {Path(__file__).name}")
-    print("=" * 60)
+    print("=" * 72)
+    print("Arc Bot setup")
+    print("=" * 72)
+
+    total_steps = len(steps) + 1
+    for index, (description, command) in enumerate(steps, start=1):
+        print(f"\n[{index}/{total_steps}] {description}")
+        subprocess.run(command, check=True)
+
+    print(f"\n[{total_steps}/{total_steps}] Review local configuration files")
+    _print_config_status()
+
+    command_prefix = f"{shlex.quote(sys.executable)} {Path(__file__).name}"
+    print("\nNext steps:")
+    print(f"  {command_prefix} --run-once")
+    print(f"  {command_prefix} --daemon")
+    print(f"  {command_prefix} --setup-cron")
+
+
+def setup_cron(schedule: str) -> None:
+    import platform
+
+    script_path = Path(__file__).resolve()
+    python_bin = shlex.quote(sys.executable)
+    quoted_script = shlex.quote(str(script_path))
+    quoted_log = shlex.quote(str(LOG_DIR / "arc_cron.log"))
+    cron_command = f"cd {shlex.quote(str(SCRIPT_DIR))} && {python_bin} {quoted_script} --run-once >> {quoted_log} 2>&1"
+    cron_entry = f"{schedule} {cron_command}"
+    cron_timezone = "CRON_TZ=Asia/Ho_Chi_Minh"
+
+    print("=" * 72)
+    print("Arc Bot cron setup")
+    print("=" * 72)
+
+    if platform.system() == "Windows":
+        print("Windows does not use cron. Create a Task Scheduler job with this command:")
+        print(f"  {sys.executable} {script_path} --run-once")
+        return
+
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        existing_crontab = result.stdout if result.returncode == 0 else ""
+        filtered_lines = [
+            line
+            for line in existing_crontab.splitlines()
+            if str(script_path) not in line
+        ]
+        filtered_lines = [line for line in filtered_lines if line.strip() != cron_timezone]
+        filtered_lines.append(cron_timezone)
+        filtered_lines.append(cron_entry)
+
+        new_crontab = "\n".join(filtered_lines).rstrip("\n") + "\n"
+        subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
+
+        print("Cron entry installed successfully.")
+        print("Timezone : Asia/Ho_Chi_Minh")
+        print(f"Schedule : {schedule}")
+        print(f"Command  : {cron_command}")
+    except FileNotFoundError:
+        print("crontab was not found on this system. Add the following command to your scheduler manually:")
+        print(f"  {cron_timezone}")
+        print(f"  {cron_entry}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        if args.setup:
+            setup_environment()
+            return 0
+
+        if args.setup_cron:
+            setup_cron(args.cron_schedule)
+            return 0
+
+        if args.daemon:
+            return asyncio.run(run_daemon(args))
+        return asyncio.run(run_once(args))
+    except ConfigError as exc:
+        log.error("%s", safe_exception_message(exc))
+        return 1
+    except subprocess.CalledProcessError as exc:
+        command = exc.cmd if isinstance(exc.cmd, str) else " ".join(exc.cmd)
+        log.error("Command failed with exit code %s: %s", exc.returncode, command)
+        return 1
+    finally:
+        _stop_proxy_tunnels_safely()
+
+
+async def _run_step(
+    account_key: str,
+    step_name: str,
+    action: Callable[[], Awaitable[T]],
+    fallback: T,
+) -> T:
+    try:
+        return await action()
+    except Exception as exc:
+        log.error("[%s] %s failed: %s", account_key, step_name, safe_exception_message(exc))
+        return fallback
+
+
+async def _open_account_context(
+    browser: Any,
+    account: Account,
+    context_options: dict[str, Any],
+    storage_file: Path,
+    is_logged_in: Callable[[Any], Awaitable[bool]],
+) -> tuple[Any, Any, bool]:
+    from browser_utils import human_delay
+
+    if storage_file.exists():
+        account_key = account_id(account.email)
+        log.info("[%s] Found saved browser session: %s", account_key, storage_file.name)
+        context = None
+        keep_context_open = False
+        try:
+            context, page = await _new_context(
+                browser,
+                {**context_options, "storage_state": str(storage_file)},
+            )
+            await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
+            await human_delay(2, 3)
+            if await is_logged_in(page):
+                keep_context_open = True
+                return context, page, True
+
+            log.warning("[%s] Saved browser session expired. Re-authentication required.", account_key)
+        except Exception as exc:
+            log.warning("[%s] Failed to load saved browser session: %s", account_key, safe_exception_message(exc))
+        finally:
+            if context is not None and not keep_context_open:
+                await context.close()
+
+        try:
+            storage_file.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "[%s] Failed to remove invalid session file %s: %s",
+                account_key,
+                storage_file.name,
+                safe_exception_message(exc),
+            )
+
+    context, page = await _new_context(browser, context_options)
+    return context, page, False
+
+
+async def _new_context(browser: Any, context_options: dict[str, Any]) -> tuple[Any, Any]:
+    context = await browser.new_context(**context_options)
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    page = await context.new_page()
+    return context, page
+
+
+async def _save_browser_session(
+    context: Any,
+    account_key: str,
+    storage_file: Path,
+    success_message: str,
+) -> None:
+    try:
+        await context.storage_state(path=str(storage_file))
+        log.info("[%s] %s to %s", account_key, success_message, storage_file.name)
+    except Exception as exc:
+        log.warning(
+            "[%s] Failed to write browser session file %s: %s",
+            account_key,
+            storage_file.name,
+            safe_exception_message(exc),
+        )
+
+
+def _stop_proxy_tunnels_safely() -> None:
+    try:
+        from browser_utils import stop_all_tunnels
+    except ImportError:
+        return
+
+    stop_all_tunnels()
+
+
+def _print_config_status() -> None:
+    files = [
+        (
+            LOCAL_ACCOUNTS_FILE,
+            True,
+            "Add one Arc login email per line in accounts.local.txt.",
+        ),
+        (
+            LOCAL_GMAIL_PASSES_FILE,
+            True,
+            "Add one Gmail app password per line in gmail_passes.local.txt. The order must match accounts.local.txt.",
+        ),
+        (
+            LOCAL_PROXIES_FILE,
+            False,
+            "Optional. Add one proxy per line in proxies.local.txt, or leave the file blank to run direct connections.",
+        ),
+    ]
+
+    for path, required, hint in files:
+        lines = read_non_comment_lines(path)
+        if path == LOCAL_ACCOUNTS_FILE and any("----" in line for line in lines):
+            print(f"  {path.name}: invalid legacy format detected. {hint}")
+            continue
+
+        if lines:
+            print(f"  {path.name}: {len(lines)} configured entr{'y' if len(lines) == 1 else 'ies'}")
+            continue
+
+        if required:
+            print(f"  {path.name}: missing required content. {hint}")
+        else:
+            print(f"  {path.name}: empty. {hint}")
+
+
+def _format_score(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "unavailable"
+
+
+def _format_gain(value: int | None) -> str:
+    if value is None:
+        return "unavailable"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value}"
+
+
+def _known_total_gain(results: list[AccountResult]) -> int:
+    total = 0
+    for result in results:
+        gained = result.gained()
+        if gained is not None:
+            total += gained
+    return total
+
+
+def _send_summary_notification(summary_text: str) -> None:
+    try:
+        from notifications import send_telegram_message
+    except ImportError:
+        return
+
+    send_telegram_message(summary_text, log)
 
 
 if __name__ == "__main__":
-    if "--setup" in sys.argv:
-        setup()
-    else:
-        try:
-            asyncio.run(main())
-        finally:
-            stop_all_tunnels()
+    sys.exit(main())

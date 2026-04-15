@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+logs/
+sessions/
+arc_state.json
+.env
+*.local.txt
