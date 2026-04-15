@@ -12,8 +12,8 @@ from typing import Callable, Sequence
 
 from playwright.async_api import Locator, Page
 
-from config import log_artifact_path
-from logging_utils import safe_exception_message
+from .config import log_artifact_path
+from .logging_utils import safe_exception_message
 
 _tunnel_servers: dict[str, tuple[int, threading.Event, threading.Thread]] = {}
 

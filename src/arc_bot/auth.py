@@ -11,15 +11,15 @@ from email.message import Message
 
 from playwright.async_api import Page
 
-from browser_utils import (
+from .browser_utils import (
     capture_debug_screenshot,
     click_first_visible,
     fill_first_visible,
     find_first_visible,
     human_delay,
 )
-from config import Account, BASE_URL
-from logging_utils import safe_exception_message
+from .config import Account, BASE_URL
+from .logging_utils import safe_exception_message
 
 LOGIN_EMAIL_SELECTORS = (
     "input[type='email']",

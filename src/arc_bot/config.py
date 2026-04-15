@@ -7,10 +7,12 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from logging_utils import redact_sensitive_text
+from .logging_utils import redact_sensitive_text
 
 BASE_URL = "https://community.arc.network"
-SCRIPT_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+SRC_DIR = PACKAGE_DIR.parent
+SCRIPT_DIR = SRC_DIR.parent
 LOG_DIR = SCRIPT_DIR / "logs"
 ACCOUNTS_FILE = SCRIPT_DIR / "accounts.txt"
 LOCAL_ACCOUNTS_FILE = SCRIPT_DIR / "accounts.local.txt"
@@ -159,12 +161,13 @@ def load_runtime_accounts(
 
     if len(gmail_passwords) < len(emails):
         raise ConfigError(
-            "gmail_passes.txt has fewer entries than accounts.txt. "
+            "The Gmail app password file has fewer entries than the account file. "
             "Each account email must have a matching Gmail app password."
         )
     if len(gmail_passwords) > len(emails):
         logger.warning(
-            "gmail_passes.txt has %d entries for %d accounts. Extra lines will be ignored.",
+            "%s has %d entries for %d accounts. Extra lines will be ignored.",
+            _resolve_config_file(LOCAL_GMAIL_PASSES_FILE, GMAIL_PASSES_FILE).name,
             len(gmail_passwords),
             len(emails),
         )
@@ -213,7 +216,8 @@ def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
     if len(proxies) < count:
         missing = count - len(proxies)
         logger.warning(
-            "proxies.txt has %d entries for %d accounts. %d account(s) will run without a proxy.",
+            "%s has %d entries for %d accounts. %d account(s) will run without a proxy.",
+            proxy_file.name,
             len(proxies),
             count,
             missing,
@@ -221,7 +225,8 @@ def _load_proxies(count: int, logger: logging.Logger) -> list[str | None]:
         proxies.extend([None] * missing)
     elif len(proxies) > count:
         logger.warning(
-            "proxies.txt has %d entries for %d accounts. Extra lines will be ignored.",
+            "%s has %d entries for %d accounts. Extra lines will be ignored.",
+            proxy_file.name,
             len(proxies),
             count,
         )

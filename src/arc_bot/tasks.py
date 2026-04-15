@@ -8,7 +8,7 @@ from typing import Any
 
 from playwright.async_api import Page
 
-from browser_utils import (
+from .browser_utils import (
     capture_debug_screenshot,
     click_first_visible,
     collect_unique_hrefs,
@@ -17,8 +17,8 @@ from browser_utils import (
     human_delay,
     scroll_slowly,
 )
-from config import BASE_URL
-from logging_utils import redact_sensitive_text, safe_exception_message
+from .config import BASE_URL
+from .logging_utils import redact_sensitive_text, safe_exception_message
 
 PROFILE_PATHS = (
     "/home/profile",

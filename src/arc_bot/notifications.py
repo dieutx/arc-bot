@@ -6,8 +6,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from config import load_runtime_env
-from logging_utils import redact_sensitive_text, safe_exception_message
+from .config import load_runtime_env
+from .logging_utils import redact_sensitive_text, safe_exception_message
 
 
 def send_telegram_message(message: str, logger: logging.Logger) -> bool:

@@ -5,6 +5,7 @@ Date: 2026-04-15
 ## Scope
 
 Reviewed the repository for hidden outbound behavior, accidental secret exposure, and operator-facing leaks in logs, state, screenshots, sessions, and notifications.
+The current codebase is packaged under `src/arc_bot` with a root compatibility wrapper.
 
 ## Findings
 
@@ -37,6 +38,8 @@ The code only contains expected outbound paths for the automation workflow:
 
 ## Hardening Notes
 
+- Main application package lives in `src/arc_bot`
+- `arc_daily.py` is retained as a compatibility entrypoint for existing cron jobs
 - Cron uses `CRON_TZ=Asia/Ho_Chi_Minh` and runs at `11 7 * * *`
 - Runtime logs go to `logs/`
 - Browser sessions go to `sessions/`
