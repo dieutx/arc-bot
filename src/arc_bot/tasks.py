@@ -13,6 +13,7 @@ from .browser_utils import (
     click_first_visible,
     collect_unique_hrefs,
     fill_first_visible,
+    goto_url_with_retries,
     goto_with_fallback_paths,
     human_delay,
     scroll_slowly,
@@ -173,7 +174,12 @@ async def get_score(page: Page, account_key: str, logger: logging.Logger) -> int
 
 async def read_content(page: Page, account_key: str, account_state: dict[str, Any], logger: logging.Logger) -> dict[str, int]:
     logger.info("[%s] Starting content tasks: 5 articles and 1 video", account_key)
-    await page.goto(f"{BASE_URL}/home/content", wait_until="domcontentloaded", timeout=90000)
+    await goto_url_with_retries(
+        f"{BASE_URL}/home/content",
+        page=page,
+        logger=logger,
+        log_context=f"[{account_key}] content page",
+    )
     await human_delay(3, 5)
 
     target_articles = 5
@@ -229,7 +235,13 @@ async def read_content(page: Page, account_key: str, account_state: dict[str, An
 
         target_url = href if href.startswith("http") else f"{BASE_URL}{href}"
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            await goto_url_with_retries(
+                target_url,
+                page=page,
+                attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+                logger=logger,
+                log_context=f"[{account_key}] content item",
+            )
             await human_delay(1, 2)
             await scroll_slowly(page, steps=random.randint(4, 8))
             dwell_seconds = random.uniform(15, 30)
@@ -269,7 +281,12 @@ async def read_content(page: Page, account_key: str, account_state: dict[str, An
 
 async def register_events(page: Page, account_key: str, account_state: dict[str, Any], logger: logging.Logger) -> int:
     logger.info("[%s] Starting event registration task", account_key)
-    await page.goto(f"{BASE_URL}/home/events", wait_until="domcontentloaded", timeout=90000)
+    await goto_url_with_retries(
+        f"{BASE_URL}/home/events",
+        page=page,
+        logger=logger,
+        log_context=f"[{account_key}] events page",
+    )
     await human_delay(2, 3)
 
     upcoming_clicked = await click_first_visible(
@@ -367,7 +384,10 @@ async def find_forum_url(page: Page, account_key: str, logger: logging.Logger) -
     try:
         nav_links = await page.locator("nav a, aside a, [class*='sidebar'] a, [class*='nav'] a").all()
         for link in nav_links:
-            href = (await link.get_attribute("href") or "").lower()
+            raw_href = (await link.get_attribute("href") or "").strip()
+            if not raw_href:
+                continue
+            href = raw_href.lower()
             text = (await link.text_content() or "").lower().strip()
             if any(keyword in href for keyword in disallowed_keywords):
                 continue
@@ -375,7 +395,7 @@ async def find_forum_url(page: Page, account_key: str, logger: logging.Logger) -
                 keyword in text or keyword in href
                 for keyword in ("forum", "discussion", "discuss", "community", "post")
             ):
-                full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
+                full_url = raw_href if raw_href.startswith("http") else f"{BASE_URL}{raw_href}"
                 logger.info(
                     "[%s] Using forum URL discovered from navigation: %s",
                     account_key,
@@ -396,7 +416,12 @@ async def find_forum_url(page: Page, account_key: str, logger: logging.Logger) -
 async def create_post(page: Page, account_key: str, logger: logging.Logger) -> bool:
     logger.info("[%s] Starting discussion post task", account_key)
     forum_url = await find_forum_url(page, account_key, logger)
-    await page.goto(forum_url, wait_until="domcontentloaded", timeout=90000)
+    await goto_url_with_retries(
+        forum_url,
+        page=page,
+        logger=logger,
+        log_context=f"[{account_key}] forum page for post creation",
+    )
     await human_delay(3, 5)
 
     create_selector = await click_first_visible(
@@ -412,7 +437,7 @@ async def create_post(page: Page, account_key: str, logger: logging.Logger) -> b
         return False
 
     title = f"Daily Discussion - {datetime.now().strftime('%B %d')}"
-    await fill_first_visible(
+    title_selector = await fill_first_visible(
         page,
         ("input[placeholder*='title' i]", "input[name='title']"),
         title,
@@ -420,6 +445,13 @@ async def create_post(page: Page, account_key: str, logger: logging.Logger) -> b
         logger=logger,
         log_context=f"[{account_key}] post title input",
     )
+    if title_selector is None:
+        logger.warning("[%s] Post title input was not found", account_key)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
     await human_delay(0.5, 1.5)
 
     post_text = random.choice(POST_TEMPLATES)
@@ -465,7 +497,12 @@ async def create_post(page: Page, account_key: str, logger: logging.Logger) -> b
 async def comment_on_posts(page: Page, account_key: str, logger: logging.Logger) -> int:
     logger.info("[%s] Starting comment task (target: 2 comments)", account_key)
     forum_url = await find_forum_url(page, account_key, logger)
-    await page.goto(forum_url, wait_until="domcontentloaded", timeout=90000)
+    await goto_url_with_retries(
+        forum_url,
+        page=page,
+        logger=logger,
+        log_context=f"[{account_key}] forum page for comments",
+    )
     await human_delay(3, 5)
 
     hrefs = await collect_unique_hrefs(page, POST_LINK_SELECTOR)
@@ -481,7 +518,13 @@ async def comment_on_posts(page: Page, account_key: str, logger: logging.Logger)
 
         target_url = href if href.startswith("http") else f"{BASE_URL}{href}"
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+            await goto_url_with_retries(
+                target_url,
+                page=page,
+                attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+                logger=logger,
+                log_context=f"[{account_key}] discussion post page",
+            )
             await human_delay(2, 4)
             await scroll_slowly(page, steps=3)
 

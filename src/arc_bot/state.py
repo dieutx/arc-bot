@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .logging_utils import safe_exception_message
+
 
 def load_state(state_file: Path, logger: logging.Logger) -> dict[str, dict[str, Any]]:
     if not state_file.exists():
@@ -62,12 +64,12 @@ def save_state(
             json.dump(normalized_state, temp_file, indent=2, ensure_ascii=False)
             temp_file.write("\n")
         os.replace(temp_path, state_file)
-    except Exception:
+    except Exception as exc:
         try:
             os.unlink(temp_path)
         except FileNotFoundError:
             pass
-        logger.error("Failed to save %s", state_file.name, exc_info=True)
+        logger.error("Failed to save %s: %s", state_file.name, safe_exception_message(exc))
         raise
 
 

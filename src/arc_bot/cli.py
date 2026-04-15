@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import random
+import re
 import shlex
 import subprocess
 import sys
@@ -56,10 +58,10 @@ ensure_runtime_dirs()
 log, log_file = configure_logger(LOG_DIR)
 
 RUNTIME_BROWSER_ARGS = [
-    "--no-sandbox",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
 ]
+CRON_SCHEDULE_RE = re.compile(r"^[\d*/,\-]+(?:\s+[\d*/,\-]+){4}$")
 
 T = TypeVar("T")
 
@@ -142,6 +144,8 @@ async def run_once(args: argparse.Namespace) -> int:
     log.info("Arc daily run started at %s", datetime.now().isoformat(sep=" ", timespec="seconds"))
     log.info("Logging to %s", log_file.name)
     log.info("Browser mode: %s", "headful" if args.headful else "headless")
+    if _needs_no_sandbox():
+        log.warning("Chromium sandbox is disabled because the current process is running as root.")
     log.info("=" * 68)
 
     accounts = load_runtime_accounts(log, selected_email=args.account)
@@ -151,7 +155,7 @@ async def run_once(args: argparse.Namespace) -> int:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=not args.headful,
-            args=RUNTIME_BROWSER_ARGS,
+            args=_browser_launch_args(),
         )
         try:
             for index, account in enumerate(accounts, start=1):
@@ -374,7 +378,7 @@ def setup_environment() -> None:
     steps: list[tuple[str, list[str]]] = [
         (
             "Install the project in editable mode",
-            [sys.executable, "-m", "pip", "install", "-e", str(SCRIPT_DIR)],
+            [sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", str(SCRIPT_DIR)],
         ),
         (
             "Install Chromium for Playwright",
@@ -412,12 +416,14 @@ def setup_environment() -> None:
 def setup_cron(schedule: str) -> None:
     import platform
 
+    validated_schedule = _validate_cron_schedule(schedule)
+
     script_path = SCRIPT_DIR / "arc_daily.py"
     python_bin = shlex.quote(sys.executable)
     quoted_script = shlex.quote(str(script_path))
     quoted_log = shlex.quote(str(LOG_DIR / "arc_cron.log"))
     cron_command = f"cd {shlex.quote(str(SCRIPT_DIR))} && {python_bin} {quoted_script} --run-once >> {quoted_log} 2>&1"
-    cron_entry = f"{schedule} {cron_command}"
+    cron_entry = f"{validated_schedule} {cron_command}"
     cron_timezone = "CRON_TZ=Asia/Ho_Chi_Minh"
 
     print("=" * 72)
@@ -446,7 +452,7 @@ def setup_cron(schedule: str) -> None:
 
         print("Cron entry installed successfully.")
         print("Timezone : Asia/Ho_Chi_Minh")
-        print(f"Schedule : {schedule}")
+        print(f"Schedule : {validated_schedule}")
         print(f"Command  : {cron_command}")
     except FileNotFoundError:
         print("crontab was not found on this system. Add the following command to your scheduler manually:")
@@ -501,7 +507,7 @@ async def _open_account_context(
     storage_file: Path,
     is_logged_in: Callable[[Any], Awaitable[bool]],
 ) -> tuple[Any, Any, bool]:
-    from .browser_utils import human_delay
+    from .browser_utils import goto_url_with_retries, human_delay
 
     if storage_file.exists():
         account_key = account_id(account.email)
@@ -513,7 +519,13 @@ async def _open_account_context(
                 browser,
                 {**context_options, "storage_state": str(storage_file)},
             )
-            await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
+            await goto_url_with_retries(
+                f"{BASE_URL}/home",
+                page=page,
+                attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+                logger=log,
+                log_context=f"[{account_key}] saved-session home page",
+            )
             await human_delay(2, 3)
             if await is_logged_in(page):
                 keep_context_open = True
@@ -642,3 +654,29 @@ def _send_summary_notification(summary_text: str) -> None:
 
 def main_cli() -> int:
     return main()
+
+
+def _browser_launch_args() -> list[str]:
+    args = list(RUNTIME_BROWSER_ARGS)
+    if _needs_no_sandbox():
+        args.insert(0, "--no-sandbox")
+    return args
+
+
+def _needs_no_sandbox() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    try:
+        return geteuid() == 0
+    except OSError:
+        return False
+
+
+def _validate_cron_schedule(schedule: str) -> str:
+    normalized = " ".join(schedule.split())
+    if not CRON_SCHEDULE_RE.fullmatch(normalized):
+        raise ConfigError(
+            "Invalid cron schedule. Use a standard five-field cron expression such as '11 7 * * *'."
+        )
+    return normalized

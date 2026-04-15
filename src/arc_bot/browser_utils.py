@@ -16,6 +16,10 @@ from .config import log_artifact_path
 from .logging_utils import safe_exception_message
 
 _tunnel_servers: dict[str, tuple[int, threading.Event, threading.Thread]] = {}
+DEFAULT_NAVIGATION_ATTEMPTS: tuple[tuple[str, int], ...] = (
+    ("domcontentloaded", 90000),
+    ("commit", 60000),
+)
 
 
 async def human_delay(min_s: float = 1.5, max_s: float = 4.0) -> None:
@@ -140,10 +144,15 @@ async def goto_with_fallback_paths(
     for path in paths:
         target_url = path if path.startswith("http") else f"{base_url}{path}"
         try:
-            response = await page.goto(
+            response = await goto_url_with_retries(
                 target_url,
-                wait_until="domcontentloaded",
-                timeout=timeout,
+                page=page,
+                attempts=(
+                    ("domcontentloaded", timeout),
+                    ("commit", max(30000, timeout // 2)),
+                ),
+                logger=logger,
+                log_context=f"{log_context or 'navigation'} -> {path}",
             )
             if response and response.status == 404:
                 continue
@@ -151,6 +160,58 @@ async def goto_with_fallback_paths(
         except Exception as exc:
             _log_selector_debug(logger, log_context, path, exc)
     return None, None
+
+
+async def goto_url_with_retries(
+    target_url: str,
+    *,
+    page: Page,
+    attempts: Sequence[tuple[str, int]] = DEFAULT_NAVIGATION_ATTEMPTS,
+    logger: logging.Logger | None = None,
+    log_context: str | None = None,
+) -> object | None:
+    last_error: Exception | None = None
+
+    for attempt_number, (wait_until, timeout_ms) in enumerate(attempts, start=1):
+        try:
+            if logger is not None and log_context is not None:
+                logger.info(
+                    "%s: navigation attempt %d/%d (wait_until=%s, timeout=%ds)",
+                    log_context,
+                    attempt_number,
+                    len(attempts),
+                    wait_until,
+                    timeout_ms // 1000,
+                )
+            response = await page.goto(target_url, wait_until=wait_until, timeout=timeout_ms)
+            if wait_until == "commit":
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=min(30000, timeout_ms))
+                except Exception:
+                    if logger is not None and log_context is not None:
+                        logger.warning(
+                            "%s: the page committed but did not reach DOMContentLoaded within %d seconds",
+                            log_context,
+                            min(30000, timeout_ms) // 1000,
+                        )
+            return response
+        except Exception as exc:
+            last_error = exc
+            if logger is not None and log_context is not None:
+                logger.warning(
+                    "%s: navigation attempt %d/%d failed: %s",
+                    log_context,
+                    attempt_number,
+                    len(attempts),
+                    safe_exception_message(exc),
+                )
+            await human_delay(1.5, 3)
+
+    context_label = log_context or "Navigation"
+    raise RuntimeError(
+        f"{context_label} failed after {len(attempts)} attempt(s). "
+        f"Last error: {safe_exception_message(last_error or 'unknown error')}"
+    )
 
 
 async def collect_unique_hrefs(
@@ -375,4 +436,4 @@ def _log_selector_debug(
 ) -> None:
     if logger is None or log_context is None:
         return
-    logger.debug("%s: selector %r failed: %s", log_context, selector, exc)
+    logger.debug("%s: selector %r failed: %s", log_context, selector, safe_exception_message(exc))

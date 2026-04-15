@@ -16,6 +16,7 @@ from .browser_utils import (
     click_first_visible,
     fill_first_visible,
     find_first_visible,
+    goto_url_with_retries,
     human_delay,
 )
 from .config import Account, BASE_URL
@@ -189,7 +190,13 @@ async def login(page: Page, account: Account, logger: logging.Logger, account_ke
         )
 
     logger.info("[%s] Opening magic link", account_key)
-    response = await page.goto(magic_link, wait_until="domcontentloaded", timeout=60000)
+    response = await goto_url_with_retries(
+        magic_link,
+        page=page,
+        attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+        logger=logger,
+        log_context=f"[{account_key}] magic link landing page",
+    )
     await human_delay(3, 5)
 
     if response and response.status == 404:
@@ -199,7 +206,13 @@ async def login(page: Page, account: Account, logger: logging.Logger, account_ke
             account_key,
         )
         await asyncio.sleep(3)
-        await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
+        await goto_url_with_retries(
+            f"{BASE_URL}/home",
+            page=page,
+            attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+            logger=logger,
+            log_context=f"[{account_key}] post-magic-link home page",
+        )
         await human_delay(3, 5)
     else:
         try:
@@ -225,7 +238,13 @@ async def login(page: Page, account: Account, logger: logging.Logger, account_ke
             "[%s] Browser is still on a login-related page. Navigating to /home manually.",
             account_key,
         )
-        await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
+        await goto_url_with_retries(
+            f"{BASE_URL}/home",
+            page=page,
+            attempts=(("domcontentloaded", 60000), ("commit", 45000)),
+            logger=logger,
+            log_context=f"[{account_key}] login fallback home page",
+        )
         await human_delay(3, 5)
 
     if await is_logged_in(page):
@@ -265,40 +284,18 @@ async def _open_sign_in_page(
         ("domcontentloaded", 120000),
         ("commit", 90000),
     )
-    last_error: Exception | None = None
 
-    for attempt_number, (wait_until, timeout_ms) in enumerate(attempts, start=1):
-        try:
-            logger.info(
-                "[%s] Loading sign-in page (attempt %d, wait_until=%s, timeout=%ds)",
-                account_key,
-                attempt_number,
-                wait_until,
-                timeout_ms // 1000,
-            )
-            await page.goto(target_url, wait_until=wait_until, timeout=timeout_ms)
-            if wait_until == "commit":
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
-                except Exception:
-                    logger.warning(
-                        "[%s] Sign-in page committed but did not reach DOMContentLoaded within 30 seconds. "
-                        "Continuing with selector-based login checks.",
-                        account_key,
-                    )
-            return
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "[%s] Sign-in page load attempt %d failed: %s",
-                account_key,
-                attempt_number,
-                exc,
-            )
-            await human_delay(2, 4)
-
-    screenshot_path = await capture_debug_screenshot(page, "sign_in_timeout", account_key, logger)
-    raise RuntimeError(
-        "Failed to open the Arc sign-in page after multiple attempts. "
-        f"Last error: {last_error}. Screenshot saved to {screenshot_path}."
-    )
+    try:
+        await goto_url_with_retries(
+            target_url,
+            page=page,
+            attempts=attempts,
+            logger=logger,
+            log_context=f"[{account_key}] sign-in page",
+        )
+    except Exception as exc:
+        screenshot_path = await capture_debug_screenshot(page, "sign_in_timeout", account_key, logger)
+        raise RuntimeError(
+            "Failed to open the Arc sign-in page after multiple attempts. "
+            f"Last error: {safe_exception_message(exc)}. Screenshot saved to {screenshot_path}."
+        ) from exc
