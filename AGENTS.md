@@ -8,15 +8,24 @@ This file is for human and AI agents working in this repository.
 
 ## Code Layout
 
-- `src/arc_bot/cli.py`: main entrypoint, CLI, setup flow, cron install, orchestration
+- `src/arc_bot/cli.py`: thin CLI entrypoint only
+- `src/arc_bot/runner.py`: browser lifecycle, per-account execution, daemon loop
+- `src/arc_bot/setup_ops.py`: setup flow, config checks, cron installation
+- `src/arc_bot/reporting.py`: summary formatting and notification handoff
+- `src/arc_bot/models.py`: shared dataclasses
 - `src/arc_bot/config.py`: runtime paths, config loading, env loading, validation
 - `src/arc_bot/logging_utils.py`: logger setup and secret redaction
 - `src/arc_bot/state.py`: local state normalization and atomic persistence
 - `src/arc_bot/browser_utils.py`: selector helpers, navigation retries, SOCKS5 bridge
 - `src/arc_bot/auth.py`: login flow and Gmail IMAP magic-link retrieval
-- `src/arc_bot/tasks.py`: task execution logic
+- `src/arc_bot/profile.py`: score lookup
+- `src/arc_bot/content.py`: content task execution
+- `src/arc_bot/events.py`: event registration task execution
+- `src/arc_bot/forum.py`: forum discovery, post creation, and commenting
+- `src/arc_bot/tasks.py`: compatibility re-export layer
 - `src/arc_bot/notifications.py`: Telegram summary delivery
 - `arc_daily.py`: compatibility wrapper for existing cron jobs
+- `ARCHITECTURE.md`: quick module map and editing guidance
 
 ## Entry Points
 
@@ -72,6 +81,10 @@ These are runtime artifacts, not source files.
 ## Editing Guidance
 
 - Prefer changing code in `src/arc_bot/`, not in generated artifacts.
+- Prefer the focused modules over the compatibility facades:
+  - runtime flow: `runner.py`
+  - setup/cron: `setup_ops.py`
+  - tasks: `profile.py`, `content.py`, `events.py`, `forum.py`
 - Keep log messages operational and concise.
 - Reuse helper functions in `browser_utils.py` instead of copying navigation or selector fallback code.
 - Preserve compatibility for the root wrapper and existing cron usage unless the user explicitly asks to break that interface.

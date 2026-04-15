@@ -11,6 +11,7 @@ The repository is organized as a Python package so it is easier to install, insp
 - `src/arc_bot/`: application package
 - `arc_daily.py`: compatibility wrapper for existing cron jobs and direct script usage
 - `pyproject.toml`: package metadata and console script definition
+- `ARCHITECTURE.md`: module map and runtime flow
 - `accounts.txt`, `gmail_passes.txt`, `proxies.txt`: tracked templates only
 - `accounts.local.txt`, `gmail_passes.local.txt`, `proxies.local.txt`: ignored runtime secrets
 
@@ -42,11 +43,19 @@ arc-bot/
       __init__.py
       __main__.py
       cli.py
+      runner.py
+      setup_ops.py
+      reporting.py
+      models.py
       config.py
       logging_utils.py
       state.py
       browser_utils.py
       auth.py
+      profile.py
+      content.py
+      events.py
+      forum.py
       tasks.py
       notifications.py
   accounts.txt
@@ -56,14 +65,29 @@ arc-bot/
 
 Module responsibilities:
 
-- `cli.py`: CLI, run orchestration, setup, cron installation, summaries
+- `cli.py`: thin CLI entrypoint that parses flags and dispatches work
+- `runner.py`: main runtime orchestration, browser launch, per-account execution, daemon loop
+- `setup_ops.py`: setup flow, config status reporting, cron installation and validation
+- `reporting.py`: summary formatting and notification dispatch boundary
+- `models.py`: small shared dataclasses used across the runtime flow
 - `config.py`: filesystem paths, env loading, account/proxy loading, config validation
 - `logging_utils.py`: logger setup and secret redaction
 - `state.py`: state normalization and atomic save
 - `browser_utils.py`: selector helpers, navigation helpers, proxy parsing, SOCKS5 bridge
 - `auth.py`: Arc login flow and Gmail IMAP magic-link retrieval
-- `tasks.py`: score lookup, content, events, post, and comment tasks
+- `profile.py`: score lookup and profile navigation
+- `content.py`: article/video task flow
+- `events.py`: event registration task flow
+- `forum.py`: forum URL detection, post creation, and commenting
+- `tasks.py`: compatibility re-export layer for the task functions above
 - `notifications.py`: Telegram summary delivery
+
+The compatibility layers are intentional:
+
+- `arc_daily.py` keeps existing cron commands stable
+- `tasks.py` keeps older internal imports stable
+
+New feature work should go into the focused modules, not back into the compatibility facades.
 
 ## Requirements
 
@@ -233,7 +257,10 @@ Runtime artifacts use hashed account labels such as `acct_529ca001` instead of r
 
 ## Security Model
 
-The project was reviewed specifically for accidental secret exposure and suspicious outbound behavior. See `SECURITY_REVIEW.md` for the full summary.
+The project was reviewed specifically for accidental secret exposure, outbound behavior, cron injection, and logging leaks.
+
+- `SECURITY_REVIEW.md`: high-level security review and outbound-path summary
+- `security_best_practices_report.md`: concrete hardening notes and review findings
 
 Current outbound paths are expected and limited to:
 
